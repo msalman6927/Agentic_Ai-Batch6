@@ -8,14 +8,17 @@ class User(BaseModel):
     @field_validator("password")
     @classmethod
     def validate_password(cls, value):
-        for char in value:
-            
-            if not any(char.isupper() for char in value):
-                raise ValueError("Password must contain at least one uppercase letter.")
+        if not any (char.isdigit() for char in value):
+            raise ValueError("Password must contain at least one digit.")
+        elif not any (char.isupper() for char in value):
+            raise ValueError("Password must contain at least one uppercase letter.")
         return value
 user=User(id="12",name="salman",password="Salman123")
 
 
 print(user.id)
+
+
+
 
 

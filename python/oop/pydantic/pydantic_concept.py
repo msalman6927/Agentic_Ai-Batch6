@@ -13,11 +13,15 @@ class User(BaseModel):
         elif not any (char.isupper() for char in value):
             raise ValueError("Password must contain at least one uppercase letter.")
         return value
+    
+data='{"id": 12, "name": "salman", "password": "Salman123"}'
+user=User.model_validate_json(data)
 user=User(id="12",name="salman",password="Salman123")
+dict_user=user.model_dump_json()
+print(dict_user)
 
 
 print(user.id)
-
 
 
 

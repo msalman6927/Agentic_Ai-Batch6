@@ -1,21 +1,15 @@
 [project]
 name = "agentic-ai-batch-6"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-authors = [
-    { name = "msalman6927", email = "m69278495@gmail.com" }
-]
-requires-python = ">=3.14"
-dependencies = [
-    "0-109",
-    "fastapi",
-    "pydantic==2.12",
-]
+requires-python = ">=3.12"
 
-[project.scripts]
-agentic-ai-batch-6 = "agentic_ai_batch_6:main"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "pydantic-settings",
+]
 
 [build-system]
-requires = ["uv_build>=0.12.10,<0.13.0"]
+requires = ["uv_build>=0.8.0,<0.9.0"]
 build-backend = "uv_build"

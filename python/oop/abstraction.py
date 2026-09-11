@@ -6,12 +6,10 @@ class Vehicle(ABC):
     @abstractmethod
     def start(self):
         pass
-
     @abstractmethod
     def stop(self):
         pass
     
-   
     def show_brand(self):
         print(f"Brand name is{self.brand}")
 class car(Vehicle):

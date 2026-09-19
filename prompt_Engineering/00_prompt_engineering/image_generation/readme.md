@@ -49,7 +49,7 @@ A well-structured prompt typically includes:
 <div style="width: 200px; border: 1px solid black; padding: 10px;">
 Hyper-realistic full-body portrait of the uploaded photo, standing casually against a smooth light-gray wall. The outfit is as worn as in winter. The hands are inside the pockets, the left hand wears a square smartwatch, one leg casually crossed over the other, relaxed and confident posture. The lighting is a professional studio, bright yet soft, premium clarity.
 
-On the wall beside him is a bold black-and-white stylized vector portrait of the same subject, rendered with modern geometric accents. Beneath the graphic, add clean bold text 'Zia Khan' in large type, and below it is a smaller font 'Agentic AI Developer'
+On the wall beside him is a bold black-and-white stylized vector portrait of the same subject, rendered with modern geometric accents. Beneath the graphic, add clean bold text 'Muhammad Salman' in large type, and below it is a smaller font 'Agentic AI Developer'
 
 Mood & Style: modern, minimalistic, premium personal-branding aesthetic, sharp contrast, sleek composition.
 

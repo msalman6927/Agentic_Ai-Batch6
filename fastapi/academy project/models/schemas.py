@@ -123,3 +123,28 @@ class EnrollmentPatch(BaseModel):
 
 class EnrollmentResponse(EnrollmentBase):
 	id: int
+
+
+class UserSignup(BaseModel):
+	email: str = Field(..., min_length=7, max_length=254)
+	password: str = Field(..., min_length=8, max_length=128)
+
+	_validate_email = validator("email", allow_reuse=True)(validate_gmail)
+	_validate_password = validator("password", allow_reuse=True)(validate_password)
+
+
+class UserLogin(BaseModel):
+	email: str = Field(..., min_length=7, max_length=254)
+	password: str = Field(..., min_length=1, max_length=128)
+
+	_validate_email = validator("email", allow_reuse=True)(validate_gmail)
+
+
+class UserResponse(BaseModel):
+	id: int
+	email: str
+
+
+class TokenResponse(BaseModel):
+	access_token: str
+	token_type: str = "bearer"

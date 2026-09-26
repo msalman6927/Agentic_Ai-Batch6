@@ -12,3 +12,12 @@ INFO:     127.0.0.1:51836 - "GET /files HTTP/1.1" 200 OK
 INFO:     127.0.0.1:64596 - "GET /static/spec_driven_development.txt HTTP/1.1" 404 Not Found
 INFO:     127.0.0.1:60673 - "POST /upload HTTP/1.1" 201 Created
 INFO:     127.0.0.1:53693 - "GET /static/profile.JPG HTTP/1.1" 200 OK
+INFO:     127.0.0.1:63258 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58287 - "GET /docs HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58287 - "GET /docs HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58287 - "GET /docs HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58287 - "GET /docs HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58287 - "GET /openapi.json HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57263 - "GET /openapi.json HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57263 - "GET /openapi.json HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57263 - "GET /openapi.json HTTP/1.1" 200 OK

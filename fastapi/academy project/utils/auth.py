@@ -2,13 +2,14 @@ import hashlib
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from config.db import users_db
+from config.db import get_db
+from models.tables import User
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 SECRET_KEY = os.environ.get("JWT_SECRET_KEY") or secrets.token_hex(32)
@@ -62,9 +63,10 @@ def _unauthorized(detail: str) -> HTTPException:
 	)
 
 
-def get_current_user(
+async def get_current_user(
 	credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
-) -> dict[str, Any]:
+	db: AsyncSession = Depends(get_db),
+) -> dict[str, str | int]:
 	if credentials is None or credentials.scheme.lower() != "bearer":
 		raise _unauthorized("Not authenticated")
 
@@ -80,8 +82,8 @@ def get_current_user(
 	except (KeyError, TypeError, ValueError):
 		raise _unauthorized("Invalid token")
 
-	user = users_db.get(user_id)
+	user = await db.get(User, user_id)
 	if user is None:
 		raise _unauthorized("User not found")
 
-	return {"id": user["id"], "email": user["email"]}
+	return {"id": user.id, "email": user.email}

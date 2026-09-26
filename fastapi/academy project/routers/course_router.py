@@ -1,49 +1,97 @@
-from fastapi import APIRouter, HTTPException, Path, status
+from fastapi import APIRouter, Depends, HTTPException, Path, status
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from config.db import courses_db, enrollments_db
+from config.db import get_db
 from models.schemas import CourseCreate, CoursePatch, CourseResponse, CourseUpdate
-from utils.helpers import delete_record, get_record, next_id
+from models.tables import Course, Enrollment
+from utils.helpers import get_or_404
 
 
 router = APIRouter(prefix="/courses", tags=["courses"])
 
+_ENROLLMENT_CONFLICT = "Cannot delete a course with active enrollments"
+
+
+async def has_enrollments(db: AsyncSession, course_id: int) -> bool:
+	result = await db.execute(
+		select(Enrollment.id).where(Enrollment.course_id == course_id).limit(1)
+	)
+	return result.scalar_one_or_none() is not None
+
 
 @router.post("", response_model=CourseResponse, status_code=status.HTTP_201_CREATED)
-def create_course(course: CourseCreate) -> dict:
-	course_id = next_id(courses_db)
-	courses_db[course_id] = {"id": course_id, **course.dict()}
-	return courses_db[course_id]
+async def create_course(
+	course: CourseCreate,
+	db: AsyncSession = Depends(get_db),
+) -> Course:
+	record = Course(**course.model_dump())
+	db.add(record)
+	await db.commit()
+	await db.refresh(record)
+	return record
 
 
 @router.get("", response_model=list[CourseResponse])
-def list_courses() -> list[dict]:
-	return list(courses_db.values())
+async def list_courses(db: AsyncSession = Depends(get_db)) -> list[Course]:
+	result = await db.execute(select(Course).order_by(Course.id))
+	return list(result.scalars().all())
 
 
 @router.get("/{course_id}", response_model=CourseResponse)
-def get_course(course_id: int = Path(..., gt=0)) -> dict:
-	return get_record(courses_db, course_id, "Course")
+async def get_course(
+	course_id: int = Path(..., gt=0),
+	db: AsyncSession = Depends(get_db),
+) -> Course:
+	return await get_or_404(db, Course, course_id, "Course")
 
 
 @router.put("/{course_id}", response_model=CourseResponse)
-def update_course(course: CourseUpdate, course_id: int = Path(..., gt=0)) -> dict:
-	get_record(courses_db, course_id, "Course")
-	courses_db[course_id] = {"id": course_id, **course.dict()}
-	return courses_db[course_id]
+async def update_course(
+	course: CourseUpdate,
+	course_id: int = Path(..., gt=0),
+	db: AsyncSession = Depends(get_db),
+) -> Course:
+	record = await get_or_404(db, Course, course_id, "Course")
+	data = course.model_dump()
+	for field, value in data.items():
+		setattr(record, field, value)
+	await db.commit()
+	return record
 
 
 @router.patch("/{course_id}", response_model=CourseResponse)
-def patch_course(course: CoursePatch, course_id: int = Path(..., gt=0)) -> dict:
-	current = get_record(courses_db, course_id, "Course")
-	current.update(course.dict(exclude_unset=True))
-	return current
+async def patch_course(
+	course: CoursePatch,
+	course_id: int = Path(..., gt=0),
+	db: AsyncSession = Depends(get_db),
+) -> Course:
+	record = await get_or_404(db, Course, course_id, "Course")
+	for field, value in course.model_dump(exclude_unset=True).items():
+		setattr(record, field, value)
+	await db.commit()
+	return record
 
 
 @router.delete("/{course_id}", response_model=CourseResponse)
-def delete_course(course_id: int = Path(..., gt=0)) -> dict:
-	if any(enrollment["course_id"] == course_id for enrollment in enrollments_db.values()):
+async def delete_course(
+	course_id: int = Path(..., gt=0),
+	db: AsyncSession = Depends(get_db),
+) -> Course:
+	record = await get_or_404(db, Course, course_id, "Course")
+	if await has_enrollments(db, course_id):
 		raise HTTPException(
 			status_code=status.HTTP_409_CONFLICT,
-			detail="Cannot delete a course with active enrollments",
+			detail=_ENROLLMENT_CONFLICT,
 		)
-	return delete_record(courses_db, course_id, "Course")
+	await db.delete(record)
+	try:
+		await db.commit()
+	except IntegrityError:
+		await db.rollback()
+		raise HTTPException(
+			status_code=status.HTTP_409_CONFLICT,
+			detail=_ENROLLMENT_CONFLICT,
+		)
+	return record

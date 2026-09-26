@@ -1,30 +1,37 @@
-from typing import Any
-
 from fastapi import HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import DeclarativeBase
 
 
-def next_id(records: dict[int, dict[str, Any]]) -> int:
-    return max(records, default=0) + 1
+async def get_or_404(
+	session: AsyncSession,
+	model: type[DeclarativeBase],
+	record_id: int,
+	resource_name: str,
+) -> DeclarativeBase:
+	record = await session.get(model, record_id)
+	if record is None:
+		raise HTTPException(
+			status_code=status.HTTP_404_NOT_FOUND,
+			detail=f"{resource_name} with id {record_id} was not found",
+		)
+	return record
 
 
-def get_record(
-    records: dict[int, dict[str, Any]],
-    record_id: int,
-    resource_name: str,
-) -> dict[str, Any]:
-    record = records.get(record_id)
-    if record is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"{resource_name} with id {record_id} was not found",
-        )
-    return record
-
-
-def delete_record(
-    records: dict[int, dict[str, Any]],
-    record_id: int,
-    resource_name: str,
-) -> dict[str, Any]:
-    get_record(records, record_id, resource_name)
-    return records.pop(record_id)
+async def ensure_email_available(
+	session: AsyncSession,
+	model: type[DeclarativeBase],
+	email: str,
+	conflict_detail: str,
+	excluded_id: int | None = None,
+) -> None:
+	stmt = select(model.id).where(model.email == email)
+	if excluded_id is not None:
+		stmt = stmt.where(model.id != excluded_id)
+	result = await session.execute(stmt)
+	if result.scalar_one_or_none() is not None:
+		raise HTTPException(
+			status_code=status.HTTP_409_CONFLICT,
+			detail=conflict_detail,
+		)

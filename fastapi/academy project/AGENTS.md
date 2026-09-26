@@ -10,6 +10,8 @@
 
 ## Rules
 
+
+
 - Keep `config/db.py` limited to typed dictionary variables. Do not add SQL, an ORM, database connections, file persistence, or external storage.
 - Keep the API centered on students, courses, and enrollments.
 - Validate student emails as Gmail addresses and validate strong passwords through Pydantic schemas.

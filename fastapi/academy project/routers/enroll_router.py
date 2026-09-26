@@ -1,85 +1,123 @@
-from fastapi import APIRouter, HTTPException, Path, status
+from fastapi import APIRouter, Depends, HTTPException, Path, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from config.db import courses_db, enrollments_db, students_db
+from config.db import get_db
 from models.schemas import (
 	EnrollmentCreate,
 	EnrollmentPatch,
 	EnrollmentResponse,
 	EnrollmentUpdate,
 )
-from utils.helpers import delete_record, get_record, next_id
+from models.tables import Course, Enrollment, Student
+from utils.helpers import get_or_404
 
 
 router = APIRouter(prefix="/enrollments", tags=["enrollments"])
 
-
-def validate_relationship(student_id: int, course_id: int) -> None:
-	get_record(students_db, student_id, "Student")
-	get_record(courses_db, course_id, "Course")
+_ALREADY_ENROLLED = "This student is already enrolled in this course"
 
 
-def ensure_unique_enrollment(
+async def validate_relationship(
+	db: AsyncSession,
+	student_id: int,
+	course_id: int,
+) -> None:
+	await get_or_404(db, Student, student_id, "Student")
+	await get_or_404(db, Course, course_id, "Course")
+
+
+async def ensure_unique_enrollment(
+	db: AsyncSession,
 	student_id: int,
 	course_id: int,
 	excluded_id: int | None = None,
 ) -> None:
-	for enrollment_id, enrollment in enrollments_db.items():
-		if enrollment_id != excluded_id and (
-			enrollment["student_id"] == student_id
-			and enrollment["course_id"] == course_id
-		):
-			raise HTTPException(
-				status_code=status.HTTP_409_CONFLICT,
-				detail="This student is already enrolled in this course",
-			)
+	stmt = select(Enrollment.id).where(
+		Enrollment.student_id == student_id,
+		Enrollment.course_id == course_id,
+	)
+	if excluded_id is not None:
+		stmt = stmt.where(Enrollment.id != excluded_id)
+	result = await db.execute(stmt)
+	if result.scalar_one_or_none() is not None:
+		raise HTTPException(
+			status_code=status.HTTP_409_CONFLICT,
+			detail=_ALREADY_ENROLLED,
+		)
 
 
 @router.post("", response_model=EnrollmentResponse, status_code=status.HTTP_201_CREATED)
-def create_enrollment(enrollment: EnrollmentCreate) -> dict:
-	validate_relationship(enrollment.student_id, enrollment.course_id)
-	ensure_unique_enrollment(enrollment.student_id, enrollment.course_id)
-	enrollment_id = next_id(enrollments_db)
-	enrollments_db[enrollment_id] = {"id": enrollment_id, **enrollment.dict()}
-	return enrollments_db[enrollment_id]
+async def create_enrollment(
+	enrollment: EnrollmentCreate,
+	db: AsyncSession = Depends(get_db),
+) -> Enrollment:
+	await validate_relationship(db, enrollment.student_id, enrollment.course_id)
+	await ensure_unique_enrollment(db, enrollment.student_id, enrollment.course_id)
+	record = Enrollment(**enrollment.model_dump())
+	db.add(record)
+	await db.commit()
+	await db.refresh(record)
+	return record
 
 
 @router.get("", response_model=list[EnrollmentResponse])
-def list_enrollments() -> list[dict]:
-	return list(enrollments_db.values())
+async def list_enrollments(db: AsyncSession = Depends(get_db)) -> list[Enrollment]:
+	result = await db.execute(select(Enrollment).order_by(Enrollment.id))
+	return list(result.scalars().all())
 
 
 @router.get("/{enrollment_id}", response_model=EnrollmentResponse)
-def get_enrollment(enrollment_id: int = Path(..., gt=0)) -> dict:
-	return get_record(enrollments_db, enrollment_id, "Enrollment")
+async def get_enrollment(
+	enrollment_id: int = Path(..., gt=0),
+	db: AsyncSession = Depends(get_db),
+) -> Enrollment:
+	return await get_or_404(db, Enrollment, enrollment_id, "Enrollment")
 
 
 @router.put("/{enrollment_id}", response_model=EnrollmentResponse)
-def update_enrollment(
+async def update_enrollment(
 	enrollment: EnrollmentUpdate,
 	enrollment_id: int = Path(..., gt=0),
-) -> dict:
-	get_record(enrollments_db, enrollment_id, "Enrollment")
-	validate_relationship(enrollment.student_id, enrollment.course_id)
-	ensure_unique_enrollment(enrollment.student_id, enrollment.course_id, enrollment_id)
-	enrollments_db[enrollment_id] = {"id": enrollment_id, **enrollment.dict()}
-	return enrollments_db[enrollment_id]
+	db: AsyncSession = Depends(get_db),
+) -> Enrollment:
+	record = await get_or_404(db, Enrollment, enrollment_id, "Enrollment")
+	await validate_relationship(db, enrollment.student_id, enrollment.course_id)
+	await ensure_unique_enrollment(
+		db, enrollment.student_id, enrollment.course_id, enrollment_id
+	)
+	record.student_id = enrollment.student_id
+	record.course_id = enrollment.course_id
+	await db.commit()
+	return record
 
 
 @router.patch("/{enrollment_id}", response_model=EnrollmentResponse)
-def patch_enrollment(
+async def patch_enrollment(
 	enrollment: EnrollmentPatch,
 	enrollment_id: int = Path(..., gt=0),
-) -> dict:
-	current = get_record(enrollments_db, enrollment_id, "Enrollment")
-	updates = enrollment.dict(exclude_unset=True)
-	candidate_student_id = updates.get("student_id", current["student_id"])
-	candidate_course_id = updates.get("course_id", current["course_id"])
-	validate_relationship(candidate_student_id, candidate_course_id)
-	ensure_unique_enrollment(candidate_student_id, candidate_course_id, enrollment_id)
-	current.update(updates)
-	return current
+	db: AsyncSession = Depends(get_db),
+) -> Enrollment:
+	record = await get_or_404(db, Enrollment, enrollment_id, "Enrollment")
+	updates = enrollment.model_dump(exclude_unset=True)
+	candidate_student_id = updates.get("student_id", record.student_id)
+	candidate_course_id = updates.get("course_id", record.course_id)
+	await validate_relationship(db, candidate_student_id, candidate_course_id)
+	await ensure_unique_enrollment(
+		db, candidate_student_id, candidate_course_id, enrollment_id
+	)
+	for field, value in updates.items():
+		setattr(record, field, value)
+	await db.commit()
+	return record
 
 
 @router.delete("/{enrollment_id}", response_model=EnrollmentResponse)
-def delete_enrollment(enrollment_id: int = Path(..., gt=0)) -> dict:
-	return delete_record(enrollments_db, enrollment_id, "Enrollment")
+async def delete_enrollment(
+	enrollment_id: int = Path(..., gt=0),
+	db: AsyncSession = Depends(get_db),
+) -> Enrollment:
+	record = await get_or_404(db, Enrollment, enrollment_id, "Enrollment")
+	await db.delete(record)
+	await db.commit()
+	return record

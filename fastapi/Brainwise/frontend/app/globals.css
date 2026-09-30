@@ -1,0 +1,77 @@
+@import "tailwindcss";
+
+:root {
+  --background: #eef3f0;
+  --foreground: #152624;
+  --ink-soft: #64736f;
+  --line: #d7e2dc;
+  --panel: #ffffff;
+  --teal: #087f73;
+  --teal-deep: #07534f;
+  --mint: #d9eee8;
+  --sun: #e5a044;
+  --sun-soft: #fff1d8;
+  --coral: #d66f5e;
+  --coral-soft: #fff0ec;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-body);
+  --font-display: var(--font-display);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background:
+    radial-gradient(circle at 82% 0%, rgba(217, 238, 232, 0.75), transparent 28rem),
+    linear-gradient(135deg, #f5f8f5 0%, var(--background) 55%, #e9f0ec 100%);
+  color: var(--foreground);
+  font-family: var(--font-body), sans-serif;
+  margin: 0;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid rgba(233, 170, 69, 0.7);
+  outline-offset: 3px;
+}
+
+::selection {
+  background: var(--mint);
+  color: var(--teal-deep);
+}
+
+::placeholder {
+  color: #8c9b96;
+}
+
+.display-font {
+  font-family: var(--font-display), serif;
+}
+
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: #c7d2ca transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

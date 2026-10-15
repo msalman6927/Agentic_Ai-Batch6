@@ -1,0 +1,20 @@
+problem---2:
+doctor was saving record of patient manually
+record of medicines
+
+
+
+
+
+tech:
+backend--->fastapi
+vector data
+hybrid retrieval
+
+
+citation tracking
+
+conversational rag
+confidence
+
+

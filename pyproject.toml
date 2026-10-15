@@ -19,4 +19,8 @@ build-backend = "uv_build"
 [tool.uv.workspace]
 members = [
     "fastapi/academy project",
+    "fastapi/Brainwise/backend",
+    "RAG/institution_RAG",
+    "RAG/medivault/backend",
+    "LANGGRAPH/weather_agent",
 ]

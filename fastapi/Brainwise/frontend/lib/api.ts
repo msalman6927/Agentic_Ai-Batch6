@@ -1,136 +1,127 @@
-import { parseSse } from "./sse";
 import type {
-  ChatAnswerRequest,
-  ChatMessageRequest,
   ErrorEnvelope,
   Message,
   RegisterResponse,
-  TokenPair,
   Topic,
+  TokenPair,
   User,
 } from "./types";
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8002";
-const API_PREFIX = `${API_BASE_URL}/api/v1`;
-const ACCESS_TOKEN_KEY = "brainwise.access";
-const REFRESH_TOKEN_KEY = "brainwise.refresh";
+const BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
+
+const ACCESS_KEY = "brainwise.access";
+const REFRESH_KEY = "brainwise.refresh";
 
 export class ApiError extends Error {
-  status: number;
-  envelope?: ErrorEnvelope;
-
-  constructor(status: number, message: string, envelope?: ErrorEnvelope) {
+  constructor(
+    public status: number,
+    public code: string,
+    message: string,
+    public retryable = false,
+    public details?: Record<string, unknown>,
+  ) {
     super(message);
-    this.name = "ApiError";
-    this.status = status;
-    this.envelope = envelope;
+  }
+  get fields(): { loc: string; msg: string }[] {
+    const f = (this.details?.fields ?? []) as { loc: string; msg: string }[];
+    return Array.isArray(f) ? f : [];
   }
 }
 
-export function getStoredTokens(): TokenPair | null {
-  if (typeof window === "undefined") return null;
-  const access = window.localStorage.getItem(ACCESS_TOKEN_KEY);
-  const refresh = window.localStorage.getItem(REFRESH_TOKEN_KEY);
-  return access && refresh ? { access, refresh } : null;
-}
-
-export function storeTokens(tokens: TokenPair) {
-  window.localStorage.setItem(ACCESS_TOKEN_KEY, tokens.access);
-  window.localStorage.setItem(REFRESH_TOKEN_KEY, tokens.refresh);
-}
-
-export function clearSession() {
-  window.localStorage.removeItem(ACCESS_TOKEN_KEY);
-  window.localStorage.removeItem(REFRESH_TOKEN_KEY);
-}
-
-async function parseError(response: Response): Promise<ApiError> {
-  let envelope: ErrorEnvelope | undefined;
-  try {
-    envelope = (await response.json()) as ErrorEnvelope;
-  } catch {
-    return new ApiError(response.status, response.statusText || "Request failed");
-  }
-  return new ApiError(response.status, envelope.error.message, envelope);
-}
-
-async function refreshTokens(): Promise<TokenPair> {
-  const tokens = getStoredTokens();
-  if (!tokens) throw new ApiError(401, "No refresh session available");
-  const response = await fetch(`${API_PREFIX}/auth/refresh`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ refresh: tokens.refresh }),
-  });
-  if (!response.ok) throw await parseError(response);
-  const nextTokens = (await response.json()) as TokenPair;
-  storeTokens(nextTokens);
-  return nextTokens;
-}
-
-export async function refreshSession(): Promise<TokenPair> {
-  return refreshTokens();
-}
-
-async function request<T>(path: string, init: RequestInit = {}, retry = true): Promise<T> {
-  const tokens = getStoredTokens();
-  const headers = new Headers(init.headers);
-  headers.set("Accept", headers.get("Accept") ?? "application/json");
-  if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  if (tokens) headers.set("Authorization", `Bearer ${tokens.access}`);
-
-  const response = await fetch(`${API_PREFIX}${path}`, { ...init, headers });
-  if (response.ok) {
-    if (response.status === 204) return undefined as T;
-    return (await response.json()) as T;
-  }
-  if (response.status === 401 && retry && tokens) {
-    try {
-      await refreshTokens();
-      return request<T>(path, init, false);
-    } catch {
-      clearSession();
-    }
-  }
-  throw await parseError(response);
-}
-
-export const api = {
-  health: () => request<{ status: string }>("/health"),
-  register: (payload: { email: string; password: string; name: string }) => request<RegisterResponse>("/auth/register", { method: "POST", body: JSON.stringify(payload) }),
-  login: (payload: { email: string; password: string }) => request<TokenPair>("/auth/login", { method: "POST", body: JSON.stringify(payload) }),
-  me: () => request<User>("/auth/me"),
-  topics: () => request<Topic[]>("/topics"),
-  createTopic: (title: string) => request<Topic>("/topics", { method: "POST", body: JSON.stringify({ title }) }),
-  messages: (topicId: string) => request<Message[]>(`/topics/${topicId}/messages`),
-  deleteTopic: (topicId: string) => request<void>(`/topics/${topicId}`, { method: "DELETE" }),
-  chat: (payload: ChatMessageRequest | ChatAnswerRequest, signal?: AbortSignal) => streamChat(payload, signal),
+const memory = { access: "" as string };
+export const tokens = {
+  get access() { return memory.access; },
+  set access(v: string) { memory.access = v; if (typeof window !== "undefined") localStorage.setItem(ACCESS_KEY, v); },
+  get refresh() { return typeof window === "undefined" ? "" : localStorage.getItem(REFRESH_KEY) ?? ""; },
+  set refresh(v: string) { if (typeof window !== "undefined") localStorage.setItem(REFRESH_KEY, v); },
+  load() { if (typeof window !== "undefined") memory.access = localStorage.getItem(ACCESS_KEY) ?? ""; },
+  clear() {
+    memory.access = "";
+    if (typeof window !== "undefined") { localStorage.removeItem(ACCESS_KEY); localStorage.removeItem(REFRESH_KEY); }
+  },
 };
 
-async function streamChat(payload: ChatMessageRequest | ChatAnswerRequest, signal?: AbortSignal, retry = true) {
-  const tokens = getStoredTokens();
-  if (!tokens) throw new ApiError(401, "You need to sign in first");
-  const response = await fetch(`${API_PREFIX}/chat`, {
-    method: "POST",
-    signal,
-    headers: {
-      Authorization: `Bearer ${tokens.access}`,
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-    },
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok) {
-    if (response.status === 401 && retry) {
-      try {
-        await refreshTokens();
-        return streamChat(payload, signal, false);
-      } catch {
-        clearSession();
-      }
-    }
-    throw await parseError(response);
-  }
-  if (!response.body) throw new Error("The server returned no stream body");
-  return parseSse(response.body);
+async function toApiError(res: Response): Promise<ApiError> {
+  let body: unknown = null;
+  try { body = await res.json(); } catch { /* empty body (e.g. 204) */ }
+  const env = body as ErrorEnvelope | null;
+  return new ApiError(
+    res.status,
+    env?.error?.code ?? (res.status === 401 ? "unauthorized" : "internal"),
+    env?.error?.message ?? `Request failed (${res.status})`,
+    env?.error?.retryable ?? false,
+    env?.error?.details,
+  );
 }
+
+// single-flight refresh: concurrent 401s share one refresh call
+let refreshing: Promise<string> | null = null;
+async function refreshAccess(): Promise<string> {
+  refreshing ??= (async () => {
+    const refresh = tokens.refresh;
+    if (!refresh) throw new ApiError(401, "unauthorized", "Not signed in");
+    const res = await fetch(`${BASE}/auth/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh }),
+    });
+    if (!res.ok) { tokens.clear(); throw await toApiError(res); }
+    const pair = (await res.json()) as TokenPair;
+    tokens.access = pair.access;
+    tokens.refresh = pair.refresh;
+    return pair.access;
+  })().finally(() => { refreshing = null; });
+  return refreshing;
+}
+
+interface ApiOptions extends Omit<RequestInit, "headers"> {
+  auth?: boolean;
+  headers?: Record<string, string>;
+}
+
+export async function api<T>(path: string, opts: ApiOptions = {}): Promise<T> {
+  const { auth = true, ...init } = opts;
+  const doFetch = (access: string) =>
+    fetch(`${BASE}${path}`, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        ...(auth && access ? { Authorization: `Bearer ${access}` } : {}),
+        ...(init.headers ?? {}),
+      },
+      cache: "no-store",
+    });
+
+  let res = await doFetch(tokens.access);
+  if (res.status === 401 && auth && !path.startsWith("/auth/") && tokens.refresh) {
+    try {
+      const access = await refreshAccess();
+      res = await doFetch(access);
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+      throw new ApiError(401, "unauthorized", "Session expired — please sign in");
+    }
+  }
+  if (!res.ok) throw await toApiError(res);
+  if (res.status === 204) return undefined as T;
+  return (await res.json()) as T;
+}
+
+export const authApi = {
+  register: (b: { email: string; password: string; name: string }) =>
+    api<RegisterResponse>("/auth/register", { method: "POST", auth: false, body: JSON.stringify(b) }),
+  login: (b: { email: string; password: string }) =>
+    api<TokenPair>("/auth/login", { method: "POST", auth: false, body: JSON.stringify(b) }),
+  me: () => api<User>("/auth/me"),
+  logout: () => tokens.clear(),
+};
+
+export const topicsApi = {
+  list: () => api<Topic[]>("/topics"),
+  create: (title: string) =>
+    api<Topic>("/topics", { method: "POST", body: JSON.stringify({ title }) }),
+  messages: (id: string) => api<Message[]>(`/topics/${id}/messages`),
+  remove: (id: string) => api<void>(`/topics/${id}`, { method: "DELETE" }),
+};
+
+export const healthApi = { check: () => api<{ status: string }>("/health", { auth: false }) };

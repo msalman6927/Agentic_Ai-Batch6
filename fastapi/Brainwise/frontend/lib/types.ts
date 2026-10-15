@@ -1,77 +1,89 @@
 export type Phase =
-  | "idle"
-  | "topic_set"
-  | "assessing"
-  | "scoring"
-  | "explaining"
-  | "follow_up";
+  | "idle" | "topic_set" | "assessing" | "scoring" | "explaining" | "follow_up";
 
-export type Difficulty = "easy" | "medium" | "hard";
 export type Level = "Foundation" | "Basic" | "Intermediate" | "Advanced";
+export type Difficulty = "easy" | "medium" | "hard";
 export type OptionLetter = "A" | "B" | "C" | "D";
-export type MessageRole = "user" | "assistant" | "system";
 
-export type User = {
-  id: string;
+export type ErrorCode =
+  | "unauthorized" | "invalid_credentials" | "forbidden" | "not_found"
+  | "invalid_phase" | "already_answered" | "unsupported_topic"
+  | "rate_limited" | "invalid_request" | "internal";
+
+export interface User {
+  id: string; // uuid
   email: string;
   name: string;
-  created_at: string;
-};
+  created_at: string; // ISO datetime
+}
 
-export type TokenPair = {
-  access: string;
-  refresh: string;
-};
+export interface TokenPair { access: string; refresh: string }
+export interface RegisterResponse extends TokenPair { user: User }
 
-export type RegisterResponse = TokenPair & { user: User };
-
-export type Topic = {
+export interface Topic {
   id: string;
   title: string;
   phase: Phase;
-  iq_score: number | null;
+  iq_score: number | null; // 85 | 95 | 110 | 128 once set
   level: Level | null;
   updated_at: string;
-};
+}
 
-export type Message = {
+export type MessageRole = "user" | "assistant" | "system";
+
+export interface Message {
   id: string;
   role: MessageRole;
-  content: string;
+  content: string; // markdown, or JSON string when phase === "assessing" (assistant)
   phase: Phase;
   created_at: string;
-};
+}
 
-export type QuestionPayload = {
+export interface QuestionOptions {
+  A: string; B: string; C: string; D: string;
+}
+
+export interface QuestionPayload {
   question_id: string;
+  thread_id: string | null;
   difficulty: Difficulty;
   text: string;
-  options: Record<OptionLetter, string>;
-  thread_id: string | null;
-};
+  options: QuestionOptions;
+}
 
-export type ScoreEvent = { iq_score: number; level: Level };
-export type PhaseEvent = { phase: Phase; question_index?: number | null; total?: number | null };
-export type DoneEvent = { thread_id: string; phase: Phase };
+export interface ScoreResult { iq_score: number; level: Level }
 
-export type ErrorCode =
-  | "unauthorized"
-  | "invalid_credentials"
-  | "forbidden"
-  | "not_found"
-  | "invalid_phase"
-  | "already_answered"
-  | "unsupported_topic"
-  | "rate_limited"
-  | "invalid_request"
-  | "internal";
+export interface ErrorBody {
+  code: ErrorCode;
+  message: string;
+  details?: Record<string, unknown>;
+  retryable: boolean;
+}
+export interface ErrorEnvelope { error: ErrorBody }
 
-export type StreamError = { code: ErrorCode; message: string; retryable: boolean };
-export type ErrorEnvelope = { error: StreamError & { details: Record<string, unknown> } };
-export type ChatMessageRequest = { topic: string; message: string } | { thread_id: string; message: string };
-export type ChatAnswerRequest = { thread_id: string; question_id: string; option: OptionLetter };
+// --- POST /chat request union ---
+export interface MessageChatRequest {
+  thread_id?: string;
+  topic?: string;
+  message: string; // 1..4000
+}
+export interface AnswerChatRequest {
+  thread_id: string;
+  question_id: string;
+  option: OptionLetter;
+}
+export type ChatRequest = MessageChatRequest | AnswerChatRequest;
 
-export type StreamEvent = {
-  event: string;
-  data: unknown;
-};
+// --- SSE event payloads ---
+export interface PhaseEvent { phase: Phase; question_index?: number | null; total?: number | null }
+export interface TokenEvent { delta: string }
+export interface DoneEvent { thread_id: string; phase: Phase }
+export interface ErrorEvent { code: ErrorCode; message: string; retryable: boolean }
+
+export type SseEvent =
+  | { event: "phase";    data: PhaseEvent }
+  | { event: "question"; data: QuestionPayload }
+  | { event: "token";    data: TokenEvent }
+  | { event: "score";    data: ScoreResult }
+  | { event: "done";     data: DoneEvent }
+  | { event: "error";    data: ErrorEvent };

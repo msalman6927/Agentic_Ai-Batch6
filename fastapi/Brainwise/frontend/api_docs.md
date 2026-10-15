@@ -1,1172 +1,1142 @@
-# Brainwise API Documentation
+# Brainwise — Frontend API & Integration Guide (`api_docs.md`)
 
-Frontend integration guide for Brainwise v1.
+> **Audience:** the coding agent / developer building the Brainwise frontend in this folder
+> (Next.js 16 App Router, React 19, TypeScript, Tailwind 4).
+> **Purpose:** everything needed to design a professional, user-friendly UI and integrate it with
+> the FastAPI backend — endpoints, wire formats, streaming contract, error handling, complete UI
+> control inventory, and copy-pasteable client code. **You should not need to open a backend
+> source file to build the frontend.**
+> **Source of truth:** `../backend/AGENTS.md` (spec) + `../backend/src/backend/**` (shapes).
+> This document was extracted from them; if you re-verify and find a mismatch, trust the code.
 
-This document is the frontend-facing API contract. It describes the public HTTP API, authentication, topic history, the assessment state machine, the streaming chat protocol, error handling, and recommended client behavior.
+---
 
-## Contents
+## Table of contents
 
-- [Quick Start](#quick-start)
-- [API Conventions](#api-conventions)
-- [Shared Types](#shared-types)
-- [Authentication](#authentication)
-- [Topics and History](#topics-and-history)
-- [Chat and SSE](#chat-and-sse)
-- [Assessment Workflow](#assessment-workflow)
-- [Follow-up Workflow](#follow-up-workflow)
-- [Errors](#errors)
-- [Frontend State Management](#frontend-state-management)
-- [TypeScript Models](#typescript-models)
-- [Integration Checklist](#integration-checklist)
-- [Scope and Limitations](#scope-and-limitations)
+1. [What Brainwise is](#1-what-brainwise-is)
+2. [Connect & run](#2-connect--run)
+3. [Authentication model](#3-authentication-model)
+4. [REST endpoint reference](#4-rest-endpoint-reference)
+5. [`POST /chat` — the SSE contract](#5-postchat--the-sse-contract)
+6. [State machine → UI matrix](#6-state-machine--ui-matrix)
+7. [API-to-UI wiring matrix](#7-api-to-ui-wiring-matrix)
+8. [Complete UI inventory (all screens, controls, placeholders)](#8-complete-ui-inventory)
+9. [TypeScript types](#9-typescript-types)
+10. [Full API client code](#10-full-api-client-code)
+11. [Error catalogue](#11-error-catalogue)
+12. [Gotchas checklist](#12-gotchas-checklist)
+13. [Routing & client state](#13-routing--client-state)
+14. [UI/UX specification](#14-uiux-specification)
+15. [Out of scope for v1](#15-out-of-scope-for-v1)
+16. [Verification checklist](#16-verification-checklist)
 
-## Quick Start
+---
 
-### Base URL
+## 1. What Brainwise is
 
-All versioned endpoints use this prefix:
+**Brainwise** is a study bot for students (secondary school → university). The student types a
+topic; Brainwise does **not** dump an explanation. It first assesses what the student already
+knows, produces a deterministic readiness score ("IQ" band), and only then delivers a complete,
+depth-matched explanation — then stays available for follow-up chat.
 
-```text
-/api/v1
+**The three promises:** **Assess** (exactly 3 adaptive MCQs) → **Score** (deterministic number +
+level label) → **Explain** (streamed markdown, calibrated to the level).
+
+```
+IDLE ──student submits topic──▶ TOPIC_SET ──bot asks Q1──▶ ASSESSING (Q1..Q3)
+   ──Q3 answered──▶ SCORING (pure Python, instant) ──▶ EXPLAINING (streamed markdown)
+   ──▶ FOLLOW_UP (free chat, no more assessment) ──new topic──▶ new thread
 ```
 
-Configure the deployment origin in the frontend instead of hard-coding it:
+**Assessment design (drives the UI):**
 
-```ts
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
-```
+- Exactly **3 questions**, each with **4 options A–D**, exactly one correct.
+- Adaptive ladder: Q1 = `medium`. Q2/Q3 = `hard` if the previous answer was correct, else `easy`.
+- Difficulty is shown to the student as a small badge (`easy | medium | hard`).
+- **No skipping, no going back, no re-attempts** inside one assessment (v1).
+- After Q3, the score is computed server-side and revealed as: `iq_score` ∈ {85, 95, 110, 128}
+  and `level` ∈ `Foundation | Basic | Intermediate | Advanced`.
 
-Example endpoint:
-
-```text
-POST http://localhost:8000/api/v1/auth/login
-```
-
-The backend's default development CORS origin is `http://localhost:3000`. Production frontend origins must be configured by the backend deployment.
-
-### First request sequence
-
-1. `POST /auth/register` or `POST /auth/login`.
-2. Store the returned `access` and `refresh` tokens according to the frontend's security policy.
-3. Send the access token as `Authorization: Bearer <access>` on protected requests.
-4. When the access token expires, call `POST /auth/refresh` with the refresh token.
-5. Use `POST /chat` to start an assessment, answer questions, generate the explanation, and send follow-ups.
-6. Use `GET /topics` and `GET /topics/{topic_id}/messages` to restore the sidebar and conversation history.
-
-## API Conventions
-
-### Headers
-
-JSON requests:
-
-```http
-Content-Type: application/json
-Accept: application/json
-```
-
-Authenticated requests additionally require:
-
-```http
-Authorization: Bearer <access-token>
-```
-
-The chat response uses:
-
-```http
-Accept: text/event-stream
-```
-
-The backend also returns `Content-Type: text/event-stream` for a successful chat request.
-
-### JSON and identifiers
-
-- Request and response bodies are JSON unless the response is an SSE stream.
-- IDs are UUID strings, for example `"12345678-1234-5678-1234-567812345678"`.
-- Timestamps are ISO-8601 UTC strings, for example `"2026-09-30T14:25:10.123456Z"`.
-- Enum values are case-sensitive in responses and lowercase unless otherwise stated.
-- Request text is trimmed and NFC-normalized by the backend.
-- Email addresses are trimmed, NFC-normalized, and lowercased by the backend.
-- Unknown request properties are rejected. Do not send fields that are not documented for that request shape.
-- Passwords are not trimmed or normalized. Send the exact password entered by the user.
-
-### HTTP success statuses
-
-| Status | Meaning |
-|---:|---|
-| `200` | Successful JSON response or successfully opened chat stream. |
-| `204` | Topic was soft-deleted; response has no body. |
-
-### Common response headers
-
-The chat stream is sent with no-cache and buffering-disabled headers. Frontend code should consume chunks as they arrive and must not wait for the entire response before updating the UI.
-
-### Health check
-
-```http
-GET /api/v1/health
-```
-
-This endpoint is public and does not require authentication.
-
-Success: `200 OK`
-
-```json
-{
-  "status": "ok"
-}
-```
-
-Use this endpoint for a lightweight availability check. It does not authenticate a user and does not verify that a specific frontend session is valid.
-
-## Shared Types
-
-### Phases
-
-A topic moves through these phases:
-
-| Phase | Meaning | Frontend behavior |
-|---|---|---|
-| `idle` | No topic is currently active. | Show the new-topic entry state. |
-| `topic_set` | Topic exists, but its assessment has not started. | A message can start the assessment. |
-| `assessing` | The next multiple-choice answer is required. | Show the current question; disable free-text chat. |
-| `scoring` | The third answer has been submitted and the score is being finalized. | Show scoring progress; do not accept another answer. |
-| `explaining` | The calibrated explanation is streaming. | Render streamed assistant tokens. |
-| `follow_up` | Assessment and explanation are complete. | Enable normal free-text chat. |
-
-The server is authoritative for the current phase. Do not advance a topic locally until the stream confirms the transition.
-
-### Assessment values
-
-```text
-Difficulty: easy | medium | hard
-Option: A | B | C | D
-Level: Foundation | Basic | Intermediate | Advanced
-Role: user | assistant | system
-```
-
-Option input is normalized to uppercase, so `"b"` is accepted and emitted as `"B"` in server-controlled payloads.
-
-### Score mapping
-
-The score is computed by the backend, never by the frontend or language model:
-
-| Correct answers | `iq_score` | `level` |
+| Correct | IQ | Level |
 |---:|---:|---|
-| 0 of 3 | 85 | `Foundation` |
-| 1 of 3 | 95 | `Basic` |
-| 2 of 3 | 110 | `Intermediate` |
-| 3 of 3 | 128 | `Advanced` |
+| 0 / 3 | 85 | Foundation |
+| 1 / 3 | 95 | Basic |
+| 2 / 3 | 110 | Intermediate |
+| 3 / 3 | 128 | Advanced |
 
-The API permits scores from 85 to 130, but the assessment currently emits only `85`, `95`, `110`, or `128`.
+**Product rules the UI must respect:**
 
-### Standard error envelope
+- Assessment runs **once per topic thread**. `follow_up` never re-assesses. A new topic = a new
+  thread = a new assessment.
+- Every message in history carries the `phase` it was produced in → **render by phase**.
+- The AI explanation is Markdown (headings, bullets, worked examples, tables) and ends with a
+  **"Want to go deeper?"** section of 2–3 suggested follow-up questions — render them as clickable
+  chips that send themselves.
+- Tone: patient, encouraging teacher. Copy should be warm, never clinical or condescending.
+- The IQ number is **server-computed only**. Never recompute, never explain how it was derived.
 
-Every non-stream error uses this shape:
+---
 
-```json
-{
-  "error": {
-    "code": "invalid_request",
-    "message": "Request validation failed",
-    "details": {
-      "fields": [
-        {
-          "loc": "body.email",
-          "msg": "value is not a valid email address",
-          "type": "value_error"
-        }
-      ]
-    },
-    "retryable": false
-  }
-}
-```
+## 2. Connect & run
 
-The `details` object is always present. It may be empty. Validation errors include `details.fields`.
+| Item | Value |
+|---|---|
+| Backend dev command (run from `../backend/`) | `uv run uvicorn backend.main:app --reload` |
+| Base URL | `http://localhost:8000` |
+| API prefix | `/api/v1` → full base `http://localhost:8000/api/v1` |
+| Liveness probe | `GET /api/v1/health` → `{"status":"ok"}` (no auth) |
+| Interactive API docs (for manual probing) | `http://localhost:8000/docs` |
+| CORS | backend allows origin `http://localhost:3000` with credentials, all methods/headers |
+| Frontend dev command (this folder) | `npm run dev` → `http://localhost:3000` |
+| Frontend lint | `npm run lint` |
 
-## Authentication
+**Environment — create `.env.local` in this folder (gitignored by the scaffold):**
 
-All authentication endpoints are under `/api/v1/auth`.
-
-### Register
-
-```http
-POST /api/v1/auth/register
-Content-Type: application/json
-```
-
-Request:
-
-```json
-{
-  "email": "student@example.com",
-  "password": "passw0rd1",
-  "name": "Amina Student"
-}
+```bash
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8000/api/v1
 ```
 
 Rules:
 
-- `email`: valid email address; trimmed and lowercased.
-- `password`: 8-72 characters, must contain at least one letter and one digit, and must be at most 72 UTF-8 bytes.
-- `name`: trimmed, non-empty, maximum 120 characters.
-- Extra fields are rejected.
+- Read it as `process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000/api/v1"` inside
+  `lib/api.ts` **only** — never hardcode the URL in components.
+- The backend and frontend must both run during development. The frontend must degrade
+  gracefully when the backend is down (see §11 `network` handling and §8 global states).
+- Tokens are sent in the `Authorization` header (no cookies) → CORS `allow_credentials` does not
+  matter for auth; still keep requests same-origin-free (call the API directly, no proxy needed).
 
-Success: `200 OK`
+---
+
+## 3. Authentication model
+
+JWT **access token (30 minutes)** + **refresh token (7 days)**, HS256, both returned in JSON
+bodies. No cookies, no server-side sessions.
+
+### Endpoints
+
+**`POST /auth/register`** → `200`
 
 ```json
+// request
+{ "email": "student@example.com", "password": "study123", "name": "Ayesha" }
+```
+
+```json
+// response — RegisterResponse (TokenPair + user)
 {
-  "access": "<jwt-access-token>",
-  "refresh": "<jwt-refresh-token>",
-  "user": {
-    "id": "12345678-1234-5678-1234-567812345678",
-    "email": "student@example.com",
-    "name": "Amina Student",
-    "created_at": "2026-09-30T14:25:10.123456Z"
-  }
+  "access": "<jwt>",
+  "refresh": "<jwt>",
+  "user": { "id": "uuid", "email": "student@example.com", "name": "Ayesha",
+            "created_at": "2026-09-30T12:00:00Z" }
 }
 ```
 
-Duplicate email: `422 invalid_request` with a field error at `body.email`.
+Validation (all → `422` with code `invalid_request`):
 
-### Login
+- `email`: valid email, trimmed + lowercased server-side. Duplicate →
+  `422 invalid_request` with `details.fields = [{loc:"body.email", msg:"email already registered",
+  type:"value_error"}]` (note: **not** 409).
+- `password`: 8–72 chars, **at least one letter and one digit**, ≤72 bytes UTF-8. Message:
+  `"password must contain at least one letter and one digit"`.
+- `name`: 1–120 chars after trim.
+- Unknown keys in the body are rejected (`extra="forbid"`).
 
-```http
-POST /api/v1/auth/login
-Content-Type: application/json
+**`POST /auth/login`** → `200` `{ "access": "...", "refresh": "..." }`
+
+- Wrong email or password → `401` code `invalid_credentials`, message
+  `"Invalid email or password"` (identical for both cases — never hint whether the account
+  exists; the UI should show exactly that message).
+
+**`POST /auth/refresh`** → `200` `{ "access": "...", "refresh": "..." }`
+
+- Body: `{ "refresh": "<jwt>" }`.
+- Expired / invalid / wrong token type / deleted user → `401` code `unauthorized`
+  (`"Token has expired"` / `"Invalid token"` / `"Invalid token type"` / `"Account no longer exists"`).
+- Stateless: the old refresh token stays valid until its own expiry (no rotation revocation).
+
+**`GET /auth/me`** (Bearer) → `200` `{ "id", "email", "name", "created_at" }`; `401 unauthorized`
+when the header is missing/malformed (`"Authorization bearer token required"`), expired, wrong
+type, or the user no longer exists.
+
+### Header format
+
+```
+Authorization: Bearer <access_token>
 ```
 
-Request:
+Missing/invalid header → `401 unauthorized`. There is **no** endpoint that accepts a refresh
+token in the header.
 
-```json
-{
-  "email": "student@example.com",
-  "password": "passw0rd1"
-}
-```
+### Refresh-on-401 algorithm (implement once, in the client — §10)
 
-Login passwords only require 1-72 characters. The registration composition rule is not re-applied during login.
+1. Attach the current access token to every request.
+2. On HTTP `401` with code `unauthorized` (and only if not already an auth endpoint and a refresh
+   token exists): call `POST /auth/refresh` **once, single-flight** (all concurrent 401s await the
+   same promise), store the new pair, retry the original request **once**.
+3. If refresh fails → clear tokens, redirect to `/login?next=<current path>`.
+4. Never retry a request that itself was the refresh call.
 
-Success: `200 OK`
+**Recommended token storage:** access token in memory (module variable) + refresh token in
+`localStorage` (`brainwise.refresh`). On app boot: if a refresh token exists, call
+`POST /auth/refresh` (or `GET /auth/me` after a silent refresh) to hydrate the session before
+rendering protected routes. Show a full-page skeleton until hydration resolves.
 
-```json
-{
-  "access": "<jwt-access-token>",
-  "refresh": "<jwt-refresh-token>"
-}
-```
+---
 
-Wrong email or password: `401 invalid_credentials`.
+## 4. REST endpoint reference
 
-### Refresh tokens
+Base = `http://localhost:8000/api/v1`. All bodies are `application/json`. All request bodies are
+strict: **sending an unknown field returns `422 invalid_request`**.
 
-```http
-POST /api/v1/auth/refresh
-Content-Type: application/json
-```
+| # | Method | Path | Auth | Success | Purpose |
+|---|---|---|---|---|---|
+| 1 | `POST` | `/auth/register` | – | `200` | create account → token pair + user |
+| 2 | `POST` | `/auth/login` | – | `200` | credentials → token pair |
+| 3 | `POST` | `/auth/refresh` | – | `200` | refresh token → new token pair |
+| 4 | `GET` | `/auth/me` | ✓ | `200` | current user |
+| 5 | `GET` | `/topics` | ✓ | `200` | my threads, newest activity first |
+| 6 | `POST` | `/topics` | ✓ | `200` | create empty thread (`phase: "topic_set"`) |
+| 7 | `GET` | `/topics/{id}/messages` | ✓ | `200` | ordered message history |
+| 8 | `DELETE` | `/topics/{id}` | ✓ | `204` | soft-delete thread (no body) |
+| 9 | `POST` | `/chat` | ✓ | `200` SSE | **the conversation endpoint (§5)** |
+| 10 | `GET` | `/health` | – | `200` | liveness |
 
-Request:
+Path params must be valid UUIDs, otherwise `422 invalid_request`.
 
-```json
-{
-  "refresh": "<jwt-refresh-token>"
-}
-```
+### 5/6. Topics
 
-Success: `200 OK`
-
-```json
-{
-  "access": "<new-jwt-access-token>",
-  "refresh": "<new-jwt-refresh-token>"
-}
-```
-
-Refresh behavior:
-
-- Access tokens last 30 minutes by default.
-- Refresh tokens last 7 days by default.
-- The refresh token must be a refresh token, not an access token.
-- Refresh is stateless in v1. There is no server-side revocation list or logout endpoint.
-- Expired, malformed, incorrectly typed, or account-invalid tokens return `401 unauthorized`.
-
-### Current user
-
-```http
-GET /api/v1/auth/me
-Authorization: Bearer <access-token>
-```
-
-Success: `200 OK`
-
-```json
-{
-  "id": "12345678-1234-5678-1234-567812345678",
-  "email": "student@example.com",
-  "name": "Amina Student",
-  "created_at": "2026-09-30T14:25:10.123456Z"
-}
-```
-
-### Recommended token retry behavior
-
-Use one refresh attempt for a failed authenticated request:
-
-1. Receive `401 unauthorized`.
-2. Call `/auth/refresh` with the stored refresh token.
-3. Replace both stored tokens with the returned pair.
-4. Retry the original request once.
-5. If refresh or the retry fails, clear the session and send the user to login.
-
-Do not retry indefinitely. Do not retry a chat request automatically after a stream has already started; use the chat resume rules instead.
-
-## Topics and History
-
-Topics are the user's study threads. All topic endpoints require an access token.
-
-### List topics
-
-```http
-GET /api/v1/topics
-Authorization: Bearer <access-token>
-```
-
-Success: `200 OK`
+**`GET /topics`** → `200`
 
 ```json
 [
-  {
-    "id": "12345678-1234-5678-1234-567812345678",
-    "title": "Photosynthesis",
-    "phase": "follow_up",
-    "iq_score": 110,
-    "level": "Intermediate",
-    "updated_at": "2026-09-30T14:32:10.123456Z"
-  },
-  {
-    "id": "87654321-4321-8765-4321-876543218765",
-    "title": "Linear Algebra",
-    "phase": "topic_set",
-    "iq_score": null,
-    "level": null,
-    "updated_at": "2026-09-30T13:10:00.000000Z"
-  }
+  { "id": "uuid", "title": "Calculus — integrals", "phase": "follow_up",
+    "iq_score": 110, "level": "Intermediate",
+    "updated_at": "2026-09-30T12:34:56Z" },
+  { "id": "uuid", "title": "Photosynthesis", "phase": "assessing",
+    "iq_score": null, "level": null,
+    "updated_at": "2026-09-30T11:00:00Z" }
 ]
 ```
 
-Behavior:
+- Sorted by `updated_at` **descending**; soft-deleted threads excluded; `[]` when empty (never 404).
+- `iq_score` / `level` are `null` until the assessment completes — render no badge yet.
+- `phase` drives what opening the thread shows (§6).
 
-- Only active topics owned by the current user are returned.
-- Results are sorted by `updated_at` descending.
-- A new topic starts at `topic_set` with `iq_score: null` and `level: null`.
-- There is no pagination in v1.
-- An account with no topics receives `[]`.
+**`POST /topics`** → `200` with the same object, `phase: "topic_set"`, `iq_score: null`.
 
-### Create a topic
+> You rarely need this: `POST /chat` with `{ "topic": ..., "message": ... }` creates the thread
+> server-side in one call. Use `POST /topics` only if you want a thread to appear in the sidebar
+> **before** the student types anything. Both flows are valid and documented in §7.
 
-```http
-POST /api/v1/topics
-Authorization: Bearer <access-token>
-Content-Type: application/json
-```
+### 7. History
 
-Request:
-
-```json
-{
-  "title": "  Linear Algebra  "
-}
-```
-
-Rules:
-
-- `title` is trimmed and NFC-normalized.
-- It must be non-empty and no longer than 200 characters.
-- Extra fields are rejected.
-
-Success: `200 OK`
-
-```json
-{
-  "id": "87654321-4321-8765-4321-876543218765",
-  "title": "Linear Algebra",
-  "phase": "topic_set",
-  "iq_score": null,
-  "level": null,
-  "updated_at": "2026-09-30T13:10:00.000000Z"
-}
-```
-
-Creating a topic only creates the thread. It does not generate question 1. Start the assessment by sending a message to `/chat` with the topic's `thread_id`.
-
-### List messages
-
-```http
-GET /api/v1/topics/{topic_id}/messages
-Authorization: Bearer <access-token>
-```
-
-Success: `200 OK`
+**`GET /topics/{id}/messages`** → `200` (ascending by `created_at`)
 
 ```json
 [
-  {
-    "id": "11111111-1111-1111-1111-111111111111",
-    "role": "user",
-    "content": "Teach me photosynthesis",
-    "phase": "topic_set",
-    "created_at": "2026-09-30T14:20:00.000000Z"
-  },
-  {
-    "id": "22222222-2222-2222-2222-222222222222",
-    "role": "assistant",
-    "content": "Photosynthesis is ...",
-    "phase": "explaining",
-    "created_at": "2026-09-30T14:21:00.000000Z"
-  }
+  { "id": "uuid", "role": "user", "content": "I want to study integrals",
+    "phase": "topic_set", "created_at": "..." },
+  { "id": "uuid", "role": "assistant",
+    "content": "{\"question_id\":\"...\",\"difficulty\":\"medium\",\"text\":\"...\",\"options\":{\"A\":\"...\",\"B\":\"...\",\"C\":\"...\",\"D\":\"...\"},\"thread_id\":\"...\"}",
+    "phase": "assessing", "created_at": "..." },
+  { "id": "uuid", "role": "user", "content": "The indefinite integral of cos x",
+    "phase": "assessing", "created_at": "..." },
+  { "id": "uuid", "role": "assistant", "content": "# Integrals ...markdown...",
+    "phase": "explaining", "created_at": "..." },
+  { "id": "uuid", "role": "user", "content": "Why do we add +C?", "phase": "follow_up",
+    "created_at": "..." },
+  { "id": "uuid", "role": "assistant", "content": "Because differentiation…",
+    "phase": "follow_up", "created_at": "..." }
 ]
 ```
 
-Behavior:
+- `role` ∈ `user | assistant | system`. You can ignore `system` (never emitted in v1).
+- **Critical:** assistant messages produced during `phase: "assessing"` store the question as a
+  **JSON string** (a serialized `QuestionPayload`). Parse it and render a question card —
+  never show raw JSON. See the restore algorithm in §12.
+- User messages produced during `phase: "assessing"` contain the **option text** the student
+  picked (not the letter).
+- Assistant messages with `phase: "explaining"` are the main Markdown explanation;
+  `phase: "follow_up"` are short chat replies (also Markdown).
+- `404 not_found` if the thread is missing, soft-deleted, or belongs to another user
+  (one generic message: `"Topic not found"`).
 
-- Messages are sorted by `created_at` ascending.
-- An empty topic returns `[]`.
-- Each message includes the phase in which it was produced.
-- The streamed assistant response is persisted after a successful stream completes.
-- A failed partial stream is not persisted as a completed assistant message.
+### 8. Delete
 
-### Delete a topic
+**`DELETE /topics/{id}`** → `204` empty body; `404 not_found` as above. The row is only soft
+deleted — the client must remove it from the sidebar immediately.
 
-```http
-DELETE /api/v1/topics/{topic_id}
-Authorization: Bearer <access-token>
-```
+### 10. Health
 
-Success: `204 No Content` with an empty body.
+**`GET /health`** → `200` `{ "status": "ok" }`. Use it for a boot connectivity check / a small
+status dot in the UI; treat failure as "backend offline" (show the offline banner, §8).
 
-Deletion is soft deletion. A deleted topic is not returned by list endpoints and cannot be loaded or used in chat.
+---
 
-A missing, deleted, or foreign topic returns the same response:
+## 5. `POST /chat` — the SSE contract
 
-```http
-404 Not Found
+**This is the heart of the app.** One endpoint drives topic start, assessment, scoring,
+explanation, and follow-up chat.
+
+- Method `POST`, path `/api/v1/chat`, requires `Authorization: Bearer <access>`.
+- Success response: `200`, `Content-Type: text/event-stream`, headers
+  `Cache-Control: no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no`.
+- The request body is **exactly one of two shapes** (a Pydantic union, `extra="forbid"`).
+
+### Request shapes
+
+**A. Message mode** — start a topic **or** continue a thread:
+
+```json
+{ "topic": "Calculus — integrals", "message": "I want to learn this" }
 ```
 
 ```json
-{
-  "error": {
-    "code": "not_found",
-    "message": "Topic not found",
-    "details": {},
-    "retryable": false
+{ "thread_id": "uuid", "message": "Why do we add +C?" }
+```
+
+- You must send **exactly one** of `topic` / `thread_id`. Sending both or neither →
+  `422 invalid_request`, message `"provide exactly one of 'thread_id' or 'topic'"`.
+- `message`: 1–4000 chars after trim. It is always persisted (except the resume path, §5.5).
+
+**B. Answer mode** — replying to the current question during `assessing`:
+
+```json
+{ "thread_id": "uuid", "question_id": "uuid", "option": "B" }
+```
+
+- `option` must be `"A" | "B" | "C" | "D"` (lowercase input is uppercased server-side).
+- Sending **message mode** while `phase === "assessing"` → `409 invalid_phase`
+  `"Answer the current question instead of sending a message"`. The composer must be disabled
+  during `assessing` so this never happens.
+
+### Consuming the stream — do **not** use `EventSource`
+
+`EventSource` is GET-only and cannot send an `Authorization` header, and this API streams from a
+`POST`. Use `fetch()` + `ReadableStream` and parse frames yourself — complete implementation in
+§10 (`streamChat`).
+
+Frame grammar: frames are separated by a blank line (`\n\n`), each frame is:
+
+```
+event: <name>\n
+data: <single-line JSON>\n
+\n
+```
+
+### Event payloads
+
+| event | payload | meaning |
+|---|---|---|
+| `phase` | `{"phase":"assessing","question_index":1,"total":3}` | phase change; `question_index`/`total` only in assessing, `scoring`/`explaining` arrive without them |
+| `question` | `{"question_id":"uuid","thread_id":"uuid","difficulty":"medium","text":"...","options":{"A":"...","B":"...","C":"...","D":"..."}}` | render the MCQ card |
+| `token` | `{"delta":"Integrals are"}` | append to the currently streaming assistant bubble |
+| `score` | `{"iq_score":110,"level":"Intermediate"}` | reveal score (before any `token` in the finish branch) |
+| `done` | `{"thread_id":"uuid","phase":"follow_up"}` | **terminal success** — finalize turn, refresh sidebar |
+| `error` | `{"code":"unsupported_topic","message":"...","retryable":true}` | **terminal failure inside the stream** |
+
+Note: `question.thread_id` is always present (even mid-stream) so you can adopt the thread if
+`done` never arrives.
+
+### 5.1 Frame sequences per branch (exact — verified by `backend/tests/test_chat_stream.py`)
+
+**Branch: assessment (question emitted)** — request shapes: message-mode start, message-mode on a
+`topic_set` thread, or answer-mode returning the next question:
+
+```
+phase   {phase:"assessing", question_index: n, total: 3}
+question{question_id, thread_id, difficulty, text, options}
+done    {thread_id, phase:"assessing"}
+```
+
+**Branch: finish (assessment complete → explanation)** — answer-mode on Q3, or resume:
+
+```
+phase   {phase:"scoring"}            ← only on the first completion (emit_scoring), skipped on resume
+phase   {phase:"explaining"}
+score   {iq_score, level}
+token   {delta}  × N                 ← streamed markdown, in order, as produced
+done    {thread_id, phase:"follow_up"}
+```
+
+**Branch: follow-up reply** (`phase === "follow_up"` message mode):
+
+```
+token   {delta}  × N                 ← may be preceded by tool-emitted frames (phase/question), rare
+done    {thread_id, phase:"follow_up"}   ← or phase:"assessing" if the agent started a NEW topic
+```
+
+**Terminal invariant:** every stream ends with **exactly one** `done` **or** one `error`, never
+both, never zero. After `error`, no further frames arrive.
+
+**Mid-stream failure:**
+
+```
+phase, phase, score, token … , error {code, message, retryable}   ← partial tokens remain visible
+```
+
+### 5.2 Errors **before** the first frame = normal HTTP responses
+
+The backend validates eagerly (auth, ownership, grading, question generation). In these cases
+**no stream starts** — you get a JSON error envelope with a non-2xx status. Always check
+`response.ok` before treating the body as a stream:
+
+| Situation | Status | code |
+|---|---|---|
+| missing/expired/wrong token | 401 | `unauthorized` |
+| thread not found / foreign / deleted | 404 | `not_found` |
+| message-mode during `assessing` | 409 | `invalid_phase` |
+| answering an already-answered question | 409 | `already_answered` |
+| topic cannot be quizzed with MCQs | 422 | `unsupported_topic` (retryable) |
+| malformed body / XOR violated / bad uuid | 422 | `invalid_request` |
+| question generator unavailable | 500 | `internal` (retryable=false, but safe to offer retry) |
+
+### 5.3 Score reveal ordering
+
+`score` always arrives **before** the first `token` of the explanation. Recommended UX: on
+`score`, show the animated IQ/level reveal card; on the first `token`, scroll/fade the reveal into
+the message list and start streaming the markdown bubble.
+
+### 5.4 Which branch am I in?
+
+Decide client-side from the current thread `phase` + what you sent (§6), then simply consume
+frames until `done`/`error`.
+
+### 5.5 Resume semantics (use these in the UI)
+
+- **Dropped explanation stream:** the thread stays `explaining`. Opening it (or sending any
+  message-mode request with `thread_id`) re-enters the finish branch and **regenerates the whole
+  explanation** (no `scoring` frame the second time). UI: auto-resume with
+  `{"thread_id": ..., "message": "continue"}` — that message is **not persisted** on this path.
+- **Interrupted answer:** if the last stored history entry is a user answer with no following
+  question (generation failed), re-submitting the same `{thread_id, question_id, option}`
+  **regenerates the next question** instead of erroring (documented resume path).
+- **Connection drop during follow-up:** the reply was not persisted → show a Retry button that
+  re-sends the same message.
+- Never leave the composer in an undefined state: exactly one request per thread may be in flight;
+  disable Send while streaming and offer Stop (AbortController).
+
+---
+
+## 6. State machine → UI matrix
+
+| `phase` | What the student sees | Enabled controls | Legal next request | Illegal (→ `409 invalid_phase`) |
+|---|---|---|---|---|
+| `idle` | *(client-only state: no thread selected — dashboard / new-topic form)* | topic input, Start | `POST /chat {topic, message}` or `POST /topics` | — |
+| `topic_set` | thread exists, assessment armed; composer with prompt "answer the first question starts automatically" | composer Send | `POST /chat {thread_id, message}` → starts Q1 | answering (no `question_id` yet) |
+| `assessing` | question card, `Question n of 3` progress, 4 options, difficulty badge; composer **disabled** | option buttons, Submit answer | `POST /chat {thread_id, question_id, option}` | sending a chat message (`409`), submitting twice (`409 already_answered`) |
+| `scoring` | brief "Calculating your level…" spinner (instant server-side; you may see it only as `phase{scoring}`) | none (auto-advances) | *(server-side)* | any student input |
+| `explaining` | score reveal → streaming markdown explanation; Stop button | Stop (abort), scroll | *(stream completes)* | sending messages |
+| `follow_up` | full chat thread + level/IQ badge; composer active | composer Send, suggested chips, new topic, delete thread | `POST /chat {thread_id, message}` | — (never re-assess in this thread) |
+
+**Transitions the client must never assume:** `follow_up` → `assessing` inside the same thread is
+impossible; to study something new, start a **new thread** (or let the follow-up agent switch —
+then `done` will carry a **different** `thread_id` with `phase: "assessing"`; navigate to it).
+
+---
+
+## 7. API-to-UI wiring matrix
+
+Every backend API/event mapped to trigger → state change → render. **Do not skip any row.**
+
+| API / event | Trigger in the UI | State change | Render |
+|---|---|---|---|
+| `POST /auth/register` | Register form submit | set tokens + `user`, clear `next` redirect | redirect to `/` (or `?next=`), toast "Welcome, {name}!" |
+| `POST /auth/login` | Login form submit | set tokens | redirect; on `401` show inline banner |
+| `POST /auth/refresh` | silent, on boot and on any `401` | rotate tokens (single-flight) | none; on failure → `/login` |
+| `GET /auth/me` | app boot (if refresh token exists) | `user` hydrated, `authLoading=false` | header avatar + name; until then full-page skeleton |
+| `GET /health` | app boot + status dot click | `backendOnline: boolean` | green/grey dot; on false show offline banner |
+| `GET /topics` | dashboard load; after `done`; after delete | `threads: Topic[]` | sidebar/thread list cards (level badge, IQ chip, relative time) |
+| `POST /topics` | "New topic" button (empty-thread flow) | prepend thread | navigate to `/chat/{id}` in `topic_set` |
+| `GET /topics/{id}/messages` | opening `/chat/{threadId}` | `messages: Message[]`, `hydrating=false` | replay history **by phase** (§12 restore algorithm) |
+| `DELETE /topics/{id}` | card 🗑 button → confirm modal | remove from `threads` | card animates out; toast "Thread deleted"; if current thread → navigate `/` |
+| `POST /chat` **{topic, message}** | first message on the new-topic form | creates thread + Q1 | optimistic user bubble → SSE: `phase`→progress dots, `question`→MCQ card, `done`→`threadId` adopted, navigate/refresh sidebar |
+| `POST /chat` **{thread_id, message}** on `topic_set` | Send in an armed thread | Q1 generated | same as above |
+| `POST /chat` **{thread_id, message}** on `follow_up` | Send / clicked suggestion chip | streaming reply | optimistic user bubble → tokens append to assistant bubble → `done` finalizes |
+| `POST /chat` **{thread_id, message}** on `scoring`/`explaining` | auto-resume on thread open | re-runs explanation | score (no `scoring` frame) → tokens → `done` |
+| `POST /chat` **{thread_id, question_id, option}** | Submit answer | grade + next question or finish | assess branch → next MCQ card + progress `n/3`; finish branch → score reveal → explanation stream |
+| SSE `phase` | stream | `phase`, `questionIndex` | update progress chip/dots, enable/disable composer |
+| SSE `question` | stream | `currentQuestion` | render MCQ card (options A–D), focus first option |
+| SSE `token` | stream | append to `streamingBuffer` | typewriter append inside markdown renderer |
+| SSE `score` | stream | `score = {iq_score, level}`, persist onto thread | animated IQ counter + level badge reveal |
+| SSE `done` | stream end | finalize message, `phase`, adopt `thread_id`, `streaming=false` | re-fetch `GET /topics` (sidebar badges update); if `phase==="assessing"` with new id → navigate to it |
+| SSE `error` | stream end | `streaming=false`, record error | inline error card in the thread with **Retry** if `retryable`, else dismiss + guidance |
+| HTTP error (pre-stream) | any call | `streaming=false` | map via §11 (toast / inline field errors / redirect) |
+
+---
+
+## 8. Complete UI inventory
+
+Build **all** of these — no placeholders left empty, no button without a state.
+
+### 8.1 Screens
+
+```
+/login            /register           /            /chat/[threadId]
+auth card      auth card         dashboard      conversation view
+```
+
+### 8.2 Login screen (`/login`)
+
+| Element | Detail |
+|---|---|
+| Card | logo wordmark "Brainwise", tagline *"Learn any topic, at your level."* |
+| Email input | `type=email`, placeholder `you@student.edu`, autoComplete `email` |
+| Password input | `type=password`, placeholder `At least 8 characters`, autoComplete `current-password` |
+| Show/hide password toggle | icon button, `aria-label="Show password"` |
+| **Sign in** button | label → `"Signing in…"` + spinner while pending; disabled until form valid |
+| Error banner | shown for `invalid_credentials` / `internal` / network: *"Invalid email or password. Try again or create an account."* |
+| Field errors | under each input, from `details.fields[].msg` |
+| Link | `"New here? Create an account"` → `/register?next=…` |
+| Footer link | `"Back to homepage"` |
+
+### 8.3 Register screen (`/register`)
+
+Same layout plus: **Full name** input (placeholder `e.g. Ayesha Khan`, maxLength 120).
+Client-side validation mirrors the server: password ≥8 chars with ≥1 letter + ≥1 digit (live
+hint: *"Use 8+ characters with at least one letter and one digit"*), email format, name non-empty.
+Duplicate email → field error under email: *"Email already registered"*. Submit button
+`"Create account"` → `"Creating your account…"`. Link: *"Already have an account? Sign in"*.
+
+### 8.4 Dashboard (`/`)
+
+| Element | Detail |
+|---|---|
+| Header | logo, user chip (avatar initial + name), **Log out** button |
+| **New topic form** | input placeholder **`"e.g. Photosynthesis, Trigonometry, HTTP caching…"`**, helper text *"Type the topic you want to study — Brainwise will ask 3 quick questions first."*, **Start learning** button (disabled when empty; shows `"Preparing your first question…"` while the SSE start request runs) |
+| Filter box | client-side search over loaded threads, placeholder `"Filter your topics…"` |
+| Thread list | cards: title, **level badge** (`Foundation/Basic/Intermediate/Advanced`, hidden when null), **IQ chip** (`IQ 110`, hidden when null), phase chip (`Assessing`/`Explaining`/`In conversation`), relative time (`2h ago`), hover actions: **Open**, **Delete** |
+| Empty state | illustration/icon + *"No topics yet — what do you want to learn today?"* + the new-topic form focused |
+| No-results state | *"No topics match “{query}”"* + clear-filter button |
+| Loading | 3 skeleton cards (shimmer) |
+| Offline | global banner (§8.6) |
+
+### 8.5 Conversation view (`/chat/[threadId]`)
+
+**Header:** back button (← to `/`), topic title (truncate), **phase chip**, progress
+`Question 2 of 3` with 3 dots (only during `assessing`), **level badge + IQ chip** (after score),
+**Delete thread** button (opens confirm modal), status dot (health).
+
+**Message list (rendered by phase):**
+
+| `phase` / role | Render as |
+|---|---|
+| `topic_set` user | user bubble (right) |
+| `assessing` assistant (JSON) | **MCQ card**: question text, difficulty badge, 4 option buttons `A`–`D`, Submit; answered state if a user message follows |
+| `assessing` user | student-answer chip (right, shows selected option text) |
+| `scoring` | centered spinner card *"Calculating your level…"* |
+| `explaining` assistant | full-width markdown article + streaming cursor while tokens arrive |
+| `follow_up` user/assistant | chat bubbles (right/left), markdown in assistant bubble |
+
+**MCQ card controls:** each option is a `<button>` showing the letter badge + text; states:
+`default / hover / focus-visible / selected / disabled / correct / incorrect` (correctness is not
+revealed by the API — do not fake it; only disable after submit). Submit button
+**"Submit answer"** (disabled until an option is selected), label → `"Checking…"` while streaming.
+Note under the card: *"There are 3 questions — no going back."*
+
+**Score reveal:** card with animated counter to `iq_score`, big **level** badge, subtext
+*"This sets the depth of your explanation."*, auto-advances when tokens start (or a
+**"Continue"** button if you pause it).
+
+**Composer (bottom):**
+
+| Phase | Placeholder | Controls |
+|---|---|---|
+| `topic_set` | `"Press Send to start your assessment"` | Send |
+| `assessing` | *"Answer the question above to continue"* | **disabled** composer (read-only textarea) |
+| `explaining` | `"Brainwise is explaining…"` | **Stop** button (aborts the stream) |
+| `follow_up` | `"Ask a follow-up about {topic}…"` | Send, char counter near 4000, Stop while streaming |
+
+Send button: icon + `aria-label="Send message"`, disabled when empty or a request is in flight.
+Enter sends, Shift+Enter newline. Max 4000 chars (counter turns amber > 3600).
+
+**Suggested follow-up chips:** after the explanation, parse the trailing *"Want to go deeper?"*
+section (bullet list of questions at the end of the markdown) and render each as a clickable chip
+(`"→ {question}"`) that fills/sends the composer. If parsing finds nothing, fall back to generic
+chips: *"Give me a simpler example"*, *"Quiz me again on this"*, *"What should I study next?"*.
+
+**Error card (in-thread):** icon + `message` + **Retry** button when `retryable === true`
+(otherwise just **Dismiss**). `unsupported_topic` gets special copy:
+*"Brainwise can't quiz this topic yet — try rephrasing it."*
+
+### 8.6 Global elements
+
+- **Toasts** (success/error, top-right, auto-dismiss 4s): account created, thread deleted, copy
+  actions, network failures.
+- **Confirm modal** (delete thread): title *"Delete “{title}”?"*, body *"This removes the thread
+  from your list. It can't be undone."*, buttons **Cancel** / **Delete** (destructive style).
+- **Offline banner** (top): *"Can't reach the Brainwise server — is the backend running on
+  port 8000?"* + **Retry** (re-runs `GET /health`).
+- **Full-page skeleton** during auth hydration.
+- **Focus management:** on route change move focus to the main heading; MCQ card receives focus
+  when a `question` event arrives.
+
+---
+
+## 9. TypeScript types
+
+Copy into `lib/types.ts`.
+
+```ts
+export type Phase =
+  | "idle" | "topic_set" | "assessing" | "scoring" | "explaining" | "follow_up";
+
+export type Level = "Foundation" | "Basic" | "Intermediate" | "Advanced";
+export type Difficulty = "easy" | "medium" | "hard";
+export type OptionLetter = "A" | "B" | "C" | "D";
+
+export type ErrorCode =
+  | "unauthorized" | "invalid_credentials" | "forbidden" | "not_found"
+  | "invalid_phase" | "already_answered" | "unsupported_topic"
+  | "rate_limited" | "invalid_request" | "internal";
+
+export interface User {
+  id: string; // uuid
+  email: string;
+  name: string;
+  created_at: string; // ISO datetime
+}
+
+export interface TokenPair { access: string; refresh: string }
+export interface RegisterResponse extends TokenPair { user: User }
+
+export interface Topic {
+  id: string;
+  title: string;
+  phase: Phase;
+  iq_score: number | null; // 85 | 95 | 110 | 128 once set
+  level: Level | null;
+  updated_at: string;
+}
+
+export type MessageRole = "user" | "assistant" | "system";
+
+export interface Message {
+  id: string;
+  role: MessageRole;
+  content: string; // markdown, or JSON string when phase === "assessing" (assistant)
+  phase: Phase;
+  created_at: string;
+}
+
+export interface QuestionOptions {
+  A: string; B: string; C: string; D: string;
+}
+
+export interface QuestionPayload {
+  question_id: string;
+  thread_id: string | null;
+  difficulty: Difficulty;
+  text: string;
+  options: QuestionOptions;
+}
+
+export interface ScoreResult { iq_score: number; level: Level }
+
+export interface ErrorBody {
+  code: ErrorCode;
+  message: string;
+  details?: Record<string, unknown>;
+  retryable: boolean;
+}
+export interface ErrorEnvelope { error: ErrorBody }
+
+// --- POST /chat request union ---
+export interface MessageChatRequest {
+  thread_id?: string;
+  topic?: string;
+  message: string; // 1..4000
+}
+export interface AnswerChatRequest {
+  thread_id: string;
+  question_id: string;
+  option: OptionLetter;
+}
+export type ChatRequest = MessageChatRequest | AnswerChatRequest;
+
+// --- SSE event payloads ---
+export interface PhaseEvent { phase: Phase; question_index?: number | null; total?: number | null }
+export interface TokenEvent { delta: string }
+export interface DoneEvent { thread_id: string; phase: Phase }
+export interface ErrorEvent { code: ErrorCode; message: string; retryable: boolean }
+
+export type SseEvent =
+  | { event: "phase";    data: PhaseEvent }
+  | { event: "question"; data: QuestionPayload }
+  | { event: "token";    data: TokenEvent }
+  | { event: "score";    data: ScoreResult }
+  | { event: "done";     data: DoneEvent }
+  | { event: "error";    data: ErrorEvent };
+```
+
+---
+
+## 10. Full API client code
+
+### 10.1 `lib/api.ts` — fetch wrapper + all REST calls + refresh-on-401
+
+```ts
+import type {
+  ChatRequest, ErrorEnvelope, Message, RegisterResponse,
+  SseEvent, Topic, TokenPair, User,
+} from "./types";
+
+const BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
+
+const ACCESS_KEY = "brainwise.access";
+const REFRESH_KEY = "brainwise.refresh";
+
+export class ApiError extends Error {
+  constructor(
+    public status: number,
+    public code: string,
+    message: string,
+    public retryable = false,
+    public details?: Record<string, unknown>,
+  ) {
+    super(message);
+  }
+  get fields(): { loc: string; msg: string }[] {
+    const f = (this.details?.fields ?? []) as { loc: string; msg: string }[];
+    return Array.isArray(f) ? f : [];
   }
 }
-```
 
-This behavior prevents the API from revealing whether another user's topic exists.
-
-## Chat and SSE
-
-`POST /api/v1/chat` is the main Brainwise endpoint. It requires an access token and returns a streamed response.
-
-### Why not `EventSource`?
-
-Native browser `EventSource` only supports a GET request and cannot send the required JSON body. Use `fetch()` with a `ReadableStream` instead.
-
-### Message mode: start or continue a conversation
-
-Start a new topic directly:
-
-```json
-{
-  "topic": "photosynthesis",
-  "message": "Teach me photosynthesis"
-}
-```
-
-Continue an existing thread:
-
-```json
-{
-  "thread_id": "12345678-1234-5678-1234-567812345678",
-  "message": "Can you give me another example?"
-}
-```
-
-Exactly one of `topic` or `thread_id` is required. `message` is always required.
-
-Rules:
-
-- `topic`: non-empty, maximum 200 characters.
-- `message`: non-empty, maximum 4000 characters.
-- `thread_id`: valid UUID.
-- Extra fields are rejected.
-- During `assessing`, free-text messages are rejected with `409 invalid_phase`.
-- During `topic_set`, the first message starts assessment and emits question 1.
-- During `follow_up`, the message is sent to the follow-up agent.
-- During `scoring` or `explaining`, a message resumes explanation generation.
-
-### Answer mode
-
-Submit the current assessment answer:
-
-```json
-{
-  "thread_id": "12345678-1234-5678-1234-567812345678",
-  "question_id": "33333333-3333-3333-3333-333333333333",
-  "option": "B"
-}
-```
-
-Rules:
-
-- All three fields are required.
-- `thread_id` and `question_id` must be valid UUIDs.
-- `option` must be `A`, `B`, `C`, or `D`. Lowercase input is accepted and normalized.
-- Do not send `message` or `topic` in answer mode.
-- The question must belong to the authenticated user's thread and be the current assessment question.
-
-### Starting the stream
-
-```ts
-const response = await fetch(`${API_BASE_URL}/api/v1/chat`, {
-  method: "POST",
-  headers: {
-    Authorization: `Bearer ${accessToken}`,
-    "Content-Type": "application/json",
-    Accept: "text/event-stream",
+const memory = { access: "" as string };
+export const tokens = {
+  get access() { return memory.access; },
+  set access(v: string) { memory.access = v; if (typeof window !== "undefined") localStorage.setItem(ACCESS_KEY, v); },
+  get refresh() { return typeof window === "undefined" ? "" : localStorage.getItem(REFRESH_KEY) ?? ""; },
+  set refresh(v: string) { if (typeof window !== "undefined") localStorage.setItem(REFRESH_KEY, v); },
+  load() { if (typeof window !== "undefined") memory.access = localStorage.getItem(ACCESS_KEY) ?? ""; },
+  clear() {
+    memory.access = "";
+    if (typeof window !== "undefined") { localStorage.removeItem(ACCESS_KEY); localStorage.removeItem(REFRESH_KEY); }
   },
-  body: JSON.stringify(payload),
-});
-
-if (!response.ok) {
-  const error = await response.json();
-  throw new ApiError(response.status, error);
-}
-
-if (!response.body) {
-  throw new Error("The server returned no stream body");
-}
-```
-
-A successful chat request returns `200 OK` immediately and then streams frames. Errors detected before the first frame return a normal HTTP error response instead.
-
-### SSE wire format
-
-Each frame has this exact structure and ends with a blank line:
-
-```text
-event: phase
-data: {"phase":"assessing","question_index":1,"total":3}
-
-```
-
-The JSON data is on one line. A parser must support multiple network chunks making up one frame. Never assume one `ReadableStream` chunk equals one SSE frame.
-
-### Recommended SSE parser
-
-```ts
-type StreamEvent = {
-  event: string;
-  data: unknown;
 };
 
-async function* parseSse(
-  body: ReadableStream<Uint8Array>,
-): AsyncGenerator<StreamEvent> {
-  const reader = body.getReader();
+async function toApiError(res: Response): Promise<ApiError> {
+  let body: unknown = null;
+  try { body = await res.json(); } catch { /* empty body (e.g. 204) */ }
+  const env = body as ErrorEnvelope | null;
+  return new ApiError(
+    res.status,
+    env?.error?.code ?? (res.status === 401 ? "unauthorized" : "internal"),
+    env?.error?.message ?? `Request failed (${res.status})`,
+    env?.error?.retryable ?? false,
+    env?.error?.details,
+  );
+}
+
+// single-flight refresh: concurrent 401s share one refresh call
+let refreshing: Promise<string> | null = null;
+async function refreshAccess(): Promise<string> {
+  refreshing ??= (async () => {
+    const refresh = tokens.refresh;
+    if (!refresh) throw new ApiError(401, "unauthorized", "Not signed in");
+    const res = await fetch(`${BASE}/auth/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh }),
+    });
+    if (!res.ok) { tokens.clear(); throw await toApiError(res); }
+    const pair = (await res.json()) as TokenPair;
+    tokens.access = pair.access;
+    tokens.refresh = pair.refresh;
+    return pair.access;
+  })().finally(() => { refreshing = null; });
+  return refreshing;
+}
+
+interface ApiOptions extends Omit<RequestInit, "headers"> { auth?: boolean }
+
+export async function api<T>(path: string, opts: ApiOptions = {}): Promise<T> {
+  const { auth = true, ...init } = opts;
+  const doFetch = (access: string) =>
+    fetch(`${BASE}${path}`, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        ...(auth && access ? { Authorization: `Bearer ${access}` } : {}),
+        ...(init.headers ?? {}),
+      },
+      cache: "no-store",
+    });
+
+  let res = await doFetch(tokens.access);
+  if (res.status === 401 && auth && !path.startsWith("/auth/") && tokens.refresh) {
+    try {
+      const access = await refreshAccess();
+      res = await doFetch(access);
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+      throw new ApiError(401, "unauthorized", "Session expired — please sign in");
+    }
+  }
+  if (!res.ok) throw await toApiError(res);
+  if (res.status === 204) return undefined as T;
+  return (await res.json()) as T;
+}
+
+export const authApi = {
+  register: (b: { email: string; password: string; name: string }) =>
+    api<RegisterResponse>("/auth/register", { method: "POST", auth: false, body: JSON.stringify(b) }),
+  login: (b: { email: string; password: string }) =>
+    api<TokenPair>("/auth/login", { method: "POST", auth: false, body: JSON.stringify(b) }),
+  me: () => api<User>("/auth/me"),
+  logout: () => tokens.clear(),
+};
+
+export const topicsApi = {
+  list: () => api<Topic[]>("/topics"),
+  create: (title: string) =>
+    api<Topic>("/topics", { method: "POST", body: JSON.stringify({ title }) }),
+  messages: (id: string) => api<Message[]>(`/topics/${id}/messages`),
+  remove: (id: string) => api<void>(`/topics/${id}`, { method: "DELETE" }),
+};
+
+export const healthApi = { check: () => api<{ status: string }>("/health", { auth: false }) };
+```
+
+### 10.2 `lib/streamChat.ts` — POST + SSE parser (an async generator)
+
+```ts
+import { ApiError, tokens } from "./api";
+import type { ChatRequest, SseEvent } from "./types";
+
+const BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
+
+export async function* streamChat(
+  body: ChatRequest,
+  signal?: AbortSignal,
+): AsyncGenerator<SseEvent> {
+  const res = await fetch(`${BASE}/chat`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(tokens.access ? { Authorization: `Bearer ${tokens.access}` } : {}),
+    },
+    body: JSON.stringify(body),
+    signal,
+    cache: "no-store",
+  });
+
+  // Failures known before the first frame arrive as a normal HTTP envelope.
+  if (!res.ok) throw await (async () => {
+    const env = await res.json().catch(() => null);
+    return new ApiError(
+      res.status,
+      env?.error?.code ?? "internal",
+      env?.error?.message ?? `Chat failed (${res.status})`,
+      env?.error?.retryable ?? false,
+      env?.error?.details,
+    );
+  })();
+  if (!res.body) throw new ApiError(500, "internal", "Empty stream response");
+
+  const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
 
+  const parseBlock = (block: string): SseEvent | null => {
+    const lines = block.split("\n");
+    const eventLine = lines.find((l) => l.startsWith("event: "));
+    const dataLine = lines.find((l) => l.startsWith("data: "));
+    if (!eventLine || !dataLine) return null;
+    const event = eventLine.slice(7).trim();
+    const data = JSON.parse(dataLine.slice(6));
+    return { event, data } as SseEvent;
+  };
+
   try {
     while (true) {
-      const { value, done } = await reader.read();
+      const { done, value } = await reader.read();
       if (done) break;
-
       buffer += decoder.decode(value, { stream: true });
-      const frames = buffer.split("\n\n");
-      buffer = frames.pop() ?? "";
-
-      for (const frame of frames) {
-        if (!frame.trim()) continue;
-
-        let event = "message";
-        let dataText = "";
-        for (const line of frame.split(/\r?\n/)) {
-          if (line.startsWith("event: ")) event = line.slice(7);
-          if (line.startsWith("data: ")) dataText += line.slice(6);
-        }
-
-        if (dataText) {
-          yield { event, data: JSON.parse(dataText) };
-        }
+      let idx: number;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        if (!block.trim()) continue;
+        const parsed = parseBlock(block);
+        if (parsed) yield parsed;
       }
-    }
-
-    buffer += decoder.decode();
-    if (buffer.trim()) {
-      throw new Error("Incomplete SSE frame");
     }
   } finally {
     reader.releaseLock();
   }
+  // Note: the terminal invariant guarantees you already saw exactly one
+  // "done" or "error" before the generator ends. If the connection died
+  // first, treat it as a retryable network error in the caller.
 }
 ```
 
-Production code should also use an `AbortController` to cancel a stream when the user leaves the page or selects another thread.
-
-## SSE Events
-
-### `phase`
-
-```json
-{
-  "phase": "assessing",
-  "question_index": 1,
-  "total": 3
-}
-```
-
-Fields:
-
-- `phase`: current server phase.
-- `question_index`: present for assessment phases, normally `1`, `2`, or `3`.
-- `total`: present for assessment phases and equal to `3`.
-
-Scoring and explanation phase events may omit `question_index` and `total`.
-
-### `question`
-
-```json
-{
-  "question_id": "33333333-3333-3333-3333-333333333333",
-  "difficulty": "medium",
-  "text": "What is the primary purpose of chlorophyll?",
-  "options": {
-    "A": "To absorb light energy",
-    "B": "To store genetic information",
-    "C": "To digest proteins",
-    "D": "To transport oxygen"
-  },
-  "thread_id": "12345678-1234-5678-1234-567812345678"
-}
-```
-
-The frontend must display the question's `text` and all four options. The correct option is never sent to the frontend.
-
-Question behavior:
-
-- Question 1 is `medium` difficulty.
-- If the previous answer is correct, the next question is `hard`.
-- If the previous answer is wrong, the next question is `easy`.
-- Exactly three questions are asked.
-- The frontend must not calculate correctness or difficulty progression.
-
-### `score`
-
-```json
-{
-  "iq_score": 110,
-  "level": "Intermediate"
-}
-```
-
-The score is emitted after the final answer and before explanation tokens. Display the score and level independently; do not parse them from assistant text.
-
-### `token`
-
-```json
-{
-  "delta": "Photosynthesis is "
-}
-```
-
-Append each `delta` to the current assistant draft in arrival order. A token event is not a complete message and must not create a separate message bubble.
-
-### `done`
-
-```json
-{
-  "thread_id": "12345678-1234-5678-1234-567812345678",
-  "phase": "follow_up"
-}
-```
-
-`done` is the successful terminal event. A healthy stream contains exactly one terminal event: either `done` or `error`.
-
-### `error`
-
-```json
-{
-  "code": "internal",
-  "message": "Something went wrong while generating a response",
-  "retryable": false
-}
-```
-
-`error` is the failed terminal event. No events should be processed after it. Partial token text may already be visible, but it must not be committed to the conversation as a completed assistant message.
-
-## Assessment Workflow
-
-### Flow 1: Start with a new topic
-
-Request:
-
-```http
-POST /api/v1/chat
-Authorization: Bearer <access-token>
-Content-Type: application/json
-Accept: text/event-stream
-```
-
-```json
-{
-  "topic": "photosynthesis",
-  "message": "Teach me photosynthesis"
-}
-```
-
-Expected event order:
-
-```text
-phase  {"phase":"assessing","question_index":1,"total":3}
-question {question 1 payload}
-done   {"thread_id":"...","phase":"assessing"}
-```
-
-The `thread_id` in the question and done events is the newly created thread ID. Store it immediately, even if the connection later drops.
-
-### Flow 2: Start assessment on an existing topic
-
-First create a topic with `POST /topics`, then send:
-
-```json
-{
-  "thread_id": "87654321-4321-8765-4321-876543218765",
-  "message": "Begin my assessment"
-}
-```
-
-The event sequence is the same as Flow 1. The topic changes from `topic_set` to `assessing`.
-
-### Flow 3: Submit question 1 or 2
-
-Request:
-
-```json
-{
-  "thread_id": "12345678-1234-5678-1234-567812345678",
-  "question_id": "33333333-3333-3333-3333-333333333333",
-  "option": "B"
-}
-```
-
-Expected event order:
-
-```text
-phase    {"phase":"assessing","question_index":2,"total":3}
-question {question 2 payload}
-done     {"thread_id":"...","phase":"assessing"}
-```
-
-The answer is graded and stored before the next question is generated. The result does not reveal whether the answer was correct.
-
-### Flow 4: Submit question 3
-
-The final answer produces:
-
-```text
-phase  {"phase":"scoring"}
-phase  {"phase":"explaining"}
-score  {"iq_score":110,"level":"Intermediate"}
-token  {"delta":"..."}
-token  {"delta":"..."}
-...
-done   {"thread_id":"...","phase":"follow_up"}
-```
-
-The explanation is streamed as Markdown text. Render it as Markdown only after applying the frontend's normal sanitization policy.
-
-When `done` arrives:
-
-- finalize the assistant message draft;
-- mark the thread `follow_up`;
-- enable the normal message composer;
-- clear the assessment question state;
-- optionally refresh `/topics` and `/topics/{id}/messages`.
-
-### Assessment answer errors
-
-- Sending a message instead of an answer while `assessing`: `409 invalid_phase`.
-- Sending an answer for the wrong thread/question: `404 not_found` or a domain error envelope, depending on the failed ownership/current-question check.
-- Sending an already answered question: normally `409 already_answered`.
-- Sending an invalid option: `422 invalid_request`.
-- Question generation failure before streaming: HTTP error envelope, usually `422 unsupported_topic` or `500 internal`.
-
-## Explanation Resume
-
-If the connection drops while the thread is `explaining`, the server leaves the thread resumable. To resume, send a normal message request using the same `thread_id`:
-
-```json
-{
-  "thread_id": "12345678-1234-5678-1234-567812345678",
-  "message": "Please continue the explanation."
-}
-```
-
-The backend regenerates the explanation and emits:
-
-```text
-phase  {"phase":"explaining"}
-score  {"iq_score":110,"level":"Intermediate"}
-token  {"delta":"..."}
-...
-done   {"thread_id":"...","phase":"follow_up"}
-```
-
-A resumed explanation does not emit a second `scoring` phase event. The score is already stored.
-
-The frontend should:
-
-1. Keep the partial draft marked as incomplete.
-2. Show a retry/resume action if the connection ends without `done` or `error`.
-3. Reload history if needed before retrying.
-4. Start a fresh assistant draft for the resumed explanation rather than silently concatenating two attempts.
-5. Replace the incomplete draft with the completed server history after the resumed stream succeeds.
-
-## Follow-up Workflow
-
-Once the thread is `follow_up`, send normal message mode:
-
-```json
-{
-  "thread_id": "12345678-1234-5678-1234-567812345678",
-  "message": "What is chlorophyll?"
-}
-```
-
-Expected event order:
-
-```text
-token  {"delta":"Chlorophyll "}
-token  {"delta":"is ..."}
-...
-done   {"thread_id":"...","phase":"follow_up"}
-```
-
-Follow-up streams normally do not emit `phase` or `score` events. The thread remains in `follow_up`.
-
-The backend may emit tool-generated events during follow-up in future-compatible implementations. A generic client should route unknown non-terminal events through an event handler rather than crashing, while the v1 documented events are `token` and `done`.
-
-## Errors
-
-### Error codes
-
-| Code | Typical HTTP status | Retryable | Frontend action |
-|---|---:|:---:|---|
-| `unauthorized` | 401 | No | Refresh once; otherwise sign out. |
-| `invalid_credentials` | 401 | No | Show a login error; do not retry automatically. |
-| `forbidden` | 403 | No | Show an access-denied state. |
-| `not_found` | 404 | No | Remove stale topic or show not-found state. |
-| `invalid_phase` | 409 | No | Refresh topic state and show the correct control. |
-| `already_answered` | 409 | No | Reload the current assessment state; do not double-submit. |
-| `unsupported_topic` | 422 | Yes | Let the user rephrase or choose another topic. |
-| `rate_limited` | 429 | Yes | Back off and offer retry. |
-| `invalid_request` | 422 | No | Show field-level validation errors. |
-| `internal` | 500 | Usually no | Show a generic failure and offer controlled retry. |
-
-The `retryable` property on the response is authoritative. For an SSE error event, use that field instead of assuming all `5xx` errors are retryable.
-
-### Validation errors
-
-Example:
-
-```json
-{
-  "error": {
-    "code": "invalid_request",
-    "message": "Request validation failed",
-    "details": {
-      "fields": [
-        {
-          "loc": "body.message",
-          "msg": "String should have at least 1 character",
-          "type": "string_too_short"
-        }
-      ]
-    },
-    "retryable": false
+**Typical consumption loop (state machine in the component):**
+
+```ts
+const ac = new AbortController();
+setStreaming(true);
+try {
+  for await (const ev of streamChat(request, ac.signal)) {
+    switch (ev.event) {
+      case "phase":   setPhase(ev.data.phase); setProgress(ev.data.question_index); break;
+      case "question": setCurrentQuestion(ev.data); setThreadId(ev.data.thread_id!); break;
+      case "score":   setScore(ev.data); break;
+      case "token":   appendToken(ev.data.delta); break;
+      case "done":    finalize(ev.data.thread_id, ev.data.phase); break;
+      case "error":   showError(ev.data); break; // terminal
+    }
   }
+} catch (e) {
+  if ((e as Error).name === "AbortError") showInfo("Stopped.");
+  else if (e instanceof ApiError) showError({ code: e.code, message: e.message, retryable: e.retryable });
+  else showNetworkError(); // stream dropped — offer Retry
+} finally {
+  setStreaming(false);
+  void topicsApi.list().then(setThreads); // refresh badges (iq/level/phase)
 }
 ```
 
-Use `loc` to associate an error with a form field. Common locations include:
-
-```text
-body.email
-body.password
-body.name
-body.title
-body.message
-body.thread_id
-body.question_id
-body.option
-path.topic_id
-```
-
-### HTTP errors versus stream errors
-
-Errors before the first SSE frame are ordinary HTTP responses:
-
-```text
-HTTP/1.1 409 Conflict
-Content-Type: application/json
-```
-
-Errors after the first frame are SSE events. The HTTP response has already started with `200`, so the frontend must inspect the terminal event:
-
-```text
-event: error
-data: {"code":"internal","message":"...","retryable":false}
-
-```
-
-Never treat an HTTP `200` chat response as a successful completed operation until `done` has been received.
-
-## Frontend State Management
-
-A practical client can maintain one state per active thread:
-
-```text
-idle
-  -> topic_set
-  -> assessing
-  -> scoring
-  -> explaining
-  -> follow_up
-```
-
-### Suggested state shape
+### 10.3 `lib/restore.ts` — replay history safely
 
 ```ts
-type ChatState = {
-  threadId: string | null;
-  phase: Phase;
-  question: QuestionPayload | null;
-  questionIndex: number | null;
-  score: ScoreEvent | null;
-  assistantDraft: string;
-  streamStatus: "idle" | "connecting" | "streaming" | "completed" | "failed";
-  streamError: StreamError | null;
-};
+import type { Message, QuestionPayload } from "./types";
+
+export type ViewItem =
+  | { kind: "user"; message: Message }
+  | { kind: "assistant-text"; message: Message }
+  | { kind: "question"; message: Message; question: QuestionPayload; answered: boolean };
+
+export function toViewItems(messages: Message[]): ViewItem[] {
+  const items: ViewItem[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role === "user") { items.push({ kind: "user", message: m }); continue; }
+    if (m.phase === "assessing") {
+      try {
+        const question = JSON.parse(m.content) as QuestionPayload;
+        const next = messages[i + 1];
+        const answered = next?.role === "user" && next.phase === "assessing";
+        items.push({ kind: "question", message: m, question, answered });
+      } catch {
+        items.push({ kind: "assistant-text", message: m }); // defensive
+      }
+      continue;
+    }
+    items.push({ kind: "assistant-text", message: m });
+  }
+  return items;
+}
+
+/** True when history ends with an answer whose next question never arrived →
+ *  re-submit the last answer (idempotent resume path, §5.5). */
+export function pendingAnswer(messages: Message[]): { question_id: string; option: "A"|"B"|"C"|"D" } | null {
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== "user" || last.phase !== "assessing") return null;
+  const prev = messages[messages.length - 2];
+  if (!prev || prev.role !== "assistant" || prev.phase !== "assessing") return null;
+  try {
+    const q = JSON.parse(prev.content) as QuestionPayload;
+    const entry = Object.entries(q.options).find(([, text]) => text === last.content);
+    if (!entry) return null;
+    return { question_id: q.question_id, option: entry[0] as "A" | "B" | "C" | "D" };
+  } catch { return null; }
+}
 ```
 
-### Event reducer rules
+**Open-thread algorithm:**
 
-| Event | State update |
-|---|---|
-| `phase` | Set `phase`; set `questionIndex` and total when supplied. |
-| `question` | Store the question, thread ID, and difficulty; clear any prior question draft. |
-| `score` | Store `iq_score` and `level`; show score UI. |
-| `token` | Append `delta` to the current assistant draft. |
-| `done` | Mark stream complete; set the confirmed phase and finalize the draft. |
-| `error` | Mark stream failed; preserve partial draft separately; do not finalize it as history. |
-| Unknown event | Log or ignore safely; do not break the stream parser. |
+1. `GET /topics/{id}/messages` → build the view with `toViewItems`.
+2. Read `topic.phase`:
+   - `topic_set` → enable composer ("press Send to start").
+   - `assessing` → if the **last** item is an unanswered question card → show it as active.
+     Else if `pendingAnswer(...)` returns a value → auto re-submit it via answer mode (resume).
+   - `scoring` / `explaining` → auto-resume: `POST /chat {thread_id, message:"continue"}`
+     (this message is not persisted), consume the finish branch.
+   - `follow_up` → enable composer.
 
-### UI behavior by phase
+---
 
-- `topic_set`: show a start-learning composer.
-- `assessing`: show exactly four answer buttons; disable the free-text composer and prevent duplicate submission while waiting.
-- `scoring`: show a short score-processing state; disable answer and text controls.
-- `explaining`: show the score, streaming Markdown, cancel/retry affordance, and disabled duplicate submit controls.
-- `follow_up`: show the finalized explanation and enable free-text follow-ups.
+## 11. Error catalogue
 
-### Duplicate submissions
+Envelope (all non-SSE failures):
 
-Disable the selected answer immediately while its request is in progress. If the user retries after a network failure, reuse the same `question_id` and selected option only after checking the current thread state. Do not send multiple concurrent answer requests for one question.
-
-### History reconciliation
-
-For the most reliable UI:
-
-- Use streaming events for immediate rendering.
-- Use `GET /topics/{id}/messages` after a completed workflow or when recovering a dropped connection.
-- Treat history as the persisted source of truth.
-- Keep an incomplete streaming draft out of the persisted message list until `done` confirms success.
-
-## TypeScript Models
-
-```ts
-export type Phase =
-  | "idle"
-  | "topic_set"
-  | "assessing"
-  | "scoring"
-  | "explaining"
-  | "follow_up";
-
-export type Difficulty = "easy" | "medium" | "hard";
-export type Level = "Foundation" | "Basic" | "Intermediate" | "Advanced";
-export type OptionLetter = "A" | "B" | "C" | "D";
-export type MessageRole = "user" | "assistant" | "system";
-
-export type User = {
-  id: string;
-  email: string;
-  name: string;
-  created_at: string;
-};
-
-export type TokenPair = {
-  access: string;
-  refresh: string;
-};
-
-export type RegisterResponse = TokenPair & {
-  user: User;
-};
-
-export type Topic = {
-  id: string;
-  title: string;
-  phase: Phase;
-  iq_score: number | null;
-  level: Level | null;
-  updated_at: string;
-};
-
-export type Message = {
-  id: string;
-  role: MessageRole;
-  content: string;
-  phase: Phase;
-  created_at: string;
-};
-
-export type QuestionOptions = Record<OptionLetter, string>;
-
-export type QuestionPayload = {
-  question_id: string;
-  difficulty: Difficulty;
-  text: string;
-  options: QuestionOptions;
-  thread_id: string | null;
-};
-
-export type ScoreEvent = {
-  iq_score: number;
-  level: Level;
-};
-
-export type PhaseEvent = {
-  phase: Phase;
-  question_index?: number | null;
-  total?: number | null;
-};
-
-export type DoneEvent = {
-  thread_id: string;
-  phase: Phase;
-};
-
-export type StreamError = {
-  code: ErrorCode;
-  message: string;
-  retryable: boolean;
-};
-
-export type ErrorCode =
-  | "unauthorized"
-  | "invalid_credentials"
-  | "forbidden"
-  | "not_found"
-  | "invalid_phase"
-  | "already_answered"
-  | "unsupported_topic"
-  | "rate_limited"
-  | "invalid_request"
-  | "internal";
-
-export type ErrorEnvelope = {
-  error: StreamError & {
-    details: Record<string, unknown>;
-  };
-};
-
-export type ChatMessageRequest =
-  | { topic: string; message: string }
-  | { thread_id: string; message: string };
-
-export type ChatAnswerRequest = {
-  thread_id: string;
-  question_id: string;
-  option: OptionLetter;
-};
+```json
+{ "error": { "code": "invalid_phase", "message": "...", "details": {}, "retryable": false } }
 ```
 
-## Integration Checklist
+422 validation adds `details.fields = [{ "loc": "body.email", "msg": "...", "type": "..." }]`.
 
-### Authentication
+| code | HTTP | retryable | UI handling |
+|---|---|---|---|
+| `unauthorized` | 401 | no | triggers silent refresh; if it fails → redirect `/login` |
+| `invalid_credentials` | 401 | no | inline banner on the login form |
+| `forbidden` | 403 | no | generic "You don't have access" (reserved; not currently emitted) |
+| `not_found` | 404 | no | thread view → "This topic no longer exists" + back to dashboard |
+| `invalid_phase` | 409 | no | in-thread card: message + **Reload thread** button (desync recovery) |
+| `already_answered` | 409 | no | re-fetch `GET /topics/{id}/messages` and re-render the latest state |
+| `unsupported_topic` | 422 | **yes** | prominent card: "Brainwise can't quiz this topic yet — try rephrasing it." + **Retry** + link to dashboard |
+| `rate_limited` | 429 | **yes** | toast "Slow down a moment" + auto-retry after 2s (reserved; not currently emitted) |
+| `invalid_request` | 422 | no | map `details.fields[].loc` → per-field messages; fallback banner |
+| `internal` | 500 | no | in-thread/toast: "Something went wrong" + **Retry** |
+| *(network / CORS / backend down)* | — | yes | offline banner + Retry (`GET /health`) |
 
-- [ ] Configure `API_BASE_URL` per environment.
-- [ ] Register or login and store both tokens.
-- [ ] Add the access bearer header to protected requests.
-- [ ] Implement one refresh attempt for `401 unauthorized`.
-- [ ] Clear session state when refresh fails.
+---
 
-### Topics
+## 12. Gotchas checklist
 
-- [ ] Load topic list on authenticated app startup.
-- [ ] Sort only for display if needed; the API already returns newest first.
-- [ ] Create topics with a title no longer than 200 characters.
-- [ ] Load message history in ascending order.
-- [ ] Handle `204` delete responses without parsing JSON.
-- [ ] Treat `404` as both stale-topic and ownership-safe not-found.
+1. **Strict bodies:** every request model forbids unknown keys → never spread extra fields.
+2. **XOR:** message mode needs exactly one of `thread_id`/`topic`.
+3. Options are uppercase `A`–`D`; ids are UUID strings.
+4. **`question` events carry `thread_id`** — adopt it immediately (start-of-thread flow: you may
+   not have an id until this event).
+5. **History JSON:** assistant messages with `phase:"assessing"` are a serialized
+   `QuestionPayload` string → parse, never render raw.
+6. `done` may arrive with a **different `thread_id`** and `phase:"assessing"` (the follow-up agent
+   started a new topic) → navigate to the new thread.
+7. Every stream ends with exactly one `done` **or** `error`. If neither arrives (connection cut),
+   treat as retryable network failure; state on the server is resumable (§5.5).
+8. Pre-stream failures are **HTTP envelopes**, not SSE `error` events — check `res.ok` first.
+9. `iq_score`/`level` are `null` until scoring; possible values are only 85/95/110/128 and the four
+   labels. Never compute or derive them client-side.
+10. `GET /topics` returns `[]`, never 404; a foreign/soft-deleted thread is one generic 404.
+11. Duplicate registration is `422 invalid_request` with a `body.email` field error — not 409.
+12. `DELETE` returns `204` with **no body** — do not `res.json()` it.
+13. During `assessing` the composer must be disabled: message-mode → `409 invalid_phase`.
+14. Re-submitting an already-answered question → `409 already_answered` (except the resume path).
+15. Path params validate as UUIDs → malformed ids give `422`, not 404.
+16. Tokens: access 30 min / refresh 7 days — handle `401 unauthorized` proactively (§10.1).
+17. Markdown arrives as plain text deltas — render incrementally; don't wait for `done`.
+18. Never buffer the whole explanation client-side: append per `token` for a live feel.
 
-### Assessment
+---
 
-- [ ] Start via topic mode or an existing `topic_set` thread.
-- [ ] Store `thread_id` from the first question event immediately.
-- [ ] Render exactly four options.
-- [ ] Submit only the current question ID.
-- [ ] Disable duplicate answer submissions.
-- [ ] Trust the server's phase, difficulty, score, and level.
-- [ ] Never expose or infer the correct answer.
+## 13. Routing & client state
 
-### Streaming
+```
+app/
+├── layout.tsx               # fonts, <AuthProvider>, <ToastProvider>, metadata
+├── page.tsx                 # dashboard (protected)
+├── login/page.tsx           # public
+├── register/page.tsx        # public
+└── chat/[threadId]/page.tsx # conversation (protected)
+lib/
+├── types.ts                 # §9
+├── api.ts                   # §10.1
+├── streamChat.ts            # §10.2
+├── restore.ts               # §10.3
+├── markdown.tsx             # markdown renderer + "Want to go deeper?" chip extraction
+└── auth.tsx                 # context: user, hydration, login/register/logout
+```
 
-- [ ] Use `fetch`, `ReadableStream`, and an SSE parser.
-- [ ] Handle arbitrary network chunk boundaries.
-- [ ] Append token deltas into one draft.
-- [ ] Require exactly one terminal `done` or `error`.
-- [ ] Treat `200` without `done` as incomplete.
-- [ ] Abort streams when leaving a thread or unmounting the screen.
-- [ ] Resume incomplete explanations using the same thread ID.
-- [ ] Reconcile with message history after completion or recovery.
+- **Auth provider:** on mount → `tokens.load()`; if a refresh token exists → refresh (or `me`) →
+  set `user`; else redirect to `/login?next=…`. Expose `{user, loading, login, register, logout}`.
+- **Thread store:** `threads: Topic[]`, `activeThreadId`, `phase`, `score`, `question`,
+  `streaming: boolean`. Exactly **one in-flight chat request per thread** — disable Send/Submit
+  while `streaming`.
+- **Middleware/protection:** gate `/` and `/chat/*` client-side (or with Next middleware reading a
+  non-httpOnly marker) — the API is the real authority; a 401 mid-session just redirects.
+- **Suggested deps** (install only if you use them): `react-markdown` + `remark-gfm` for
+  markdown, `lucide-react` for icons, `clsx` for class merging. Tailwind 4 is already configured.
+- **Next.js 16 note:** this scaffold's `AGENTS.md` says this version has breaking changes — read
+  the relevant guide in `node_modules/next/dist/docs/` before writing routing/server code, and
+  keep the `<!-- BEGIN:nextjs-agent-rules -->` block intact.
 
-### UI quality
+---
 
-- [ ] Show clear loading states for auth, topic loading, answer submission, scoring, and streaming.
-- [ ] Keep the answer controls stable while the next question loads.
-- [ ] Render explanation Markdown safely.
-- [ ] Preserve partial text when displaying a failure, but label it incomplete.
-- [ ] Show field-level validation messages from `details.fields`.
-- [ ] Provide a controlled retry action for retryable errors.
-- [ ] Do not allow free-text messages during assessment.
+## 14. UI/UX specification
 
-## Scope and Limitations
+### Design direction
 
-Brainwise v1 intentionally does not expose:
+Calm, focused **study/tutor** aesthetic: generous whitespace, readable serif-ish display headings
+with a clean sans body (or the scaffold's default font stack), long-form line-height ≥1.6 for
+explanations, high-contrast text (WCAG AA), soft card shadows, rounded-2xl surfaces.
 
-- file uploads;
-- retrieval-augmented generation or user documents;
-- image generation;
-- voice input or output;
-- multi-language model output;
-- pagination or search endpoints;
-- WebSocket transport;
-- a logout endpoint or refresh-token revocation;
-- a separate assessment-results endpoint;
-- an endpoint exposing the correct answer or raw correctness per question.
+Suggested tokens (Tailwind 4 CSS variables in `globals.css`):
 
-The frontend should use the documented routes only. Internal SQLAlchemy models, agent tools, prompts, database tables, and provider configuration are not frontend APIs.
+```
+--background:#f8fafc  --surface:#ffffff  --brand:#4f46e5 (indigo-600)
+--accent:#0ea5e9      --success:#16a34a  --warning:#d97706  --danger:#dc2626
+--muted:#64748b       --border:#e2e8f0
+Level chips: Foundation #f59e0b · Basic #22c55e · Intermediate #3b82f6 · Advanced #a855f7
+```
+
+### Layout
+
+- **Desktop:** fixed 280px left sidebar (new-topic form + thread list) / main column max-w-3xl
+  centered, sticky header, composer pinned to the bottom.
+- **Mobile (<768px):** sidebar becomes a slide-over drawer (hamburger in header); composer sticks
+  above the safe area; touch targets ≥44px.
+
+### Per-screen behavior
+
+1. **Auth:** single centered card, logo, form, inline errors, loading on submit, redirect back to
+   `?next=`.
+2. **Dashboard:** hero line *"What do you want to learn today?"*, prominent new-topic form,
+   responsive card grid/list, hover reveal actions, empty/loading/offline states.
+3. **Assessment:** card-focused, distraction-free (sidebar dimmed), progress dots top, options as
+   large stacked buttons with letter badges, keyboard shortcuts **1–4 or A–D** select,
+   **Enter** submits, announce progress via `aria-live="polite"`.
+4. **Score reveal:** full-width celebratory-but-restrained card; count-up animation ~800ms; level
+   badge scale-in; then auto-scroll to the explanation.
+5. **Explanation:** markdown article (h2/h3 spacing, styled lists/tables/code), sticky "level +
+   IQ" chip while reading, streaming cursor (blinking block), Stop button visible.
+6. **Follow-up:** standard chat ergonomics — user bubbles right (brand tint), assistant left
+   (surface), markdown inside assistant bubbles, suggestion chips row above the composer,
+   auto-scroll unless the user scrolled up (then show a "Jump to latest" pill).
+
+### Accessibility
+
+- All interactive elements are real `<button>`/`<input>` with visible focus rings.
+- `aria-live="polite"` region announcing streamed text (throttle updates) and phase changes.
+- Modal: focus trap, Escape closes, return focus to trigger.
+- Every icon-only control has an `aria-label`; color is never the only signal (chips carry text).
+- Respect `prefers-reduced-motion` (disable count-up/typewriter easing).
+
+### Empty / loading / error states (must all exist)
+
+Dashboard: skeleton cards · no topics · no filter matches · offline banner.
+Conversation: hydrating skeleton · generating-question shimmer ("Brainwise is writing question 2…")
+· scoring spinner · streaming · stream error card (with Retry) · thread-not-found · offline.
+
+---
+
+## 15. Out of scope for v1
+
+Do not build unprompted: file uploads/RAG, image generation, multi-language UI, voice, spaced
+repetition, leaderboards, admin panel, dark-mode requirement (optional extra is fine), WebSocket
+transport (SSE only), Docker/K8s deploy configs.
+
+---
+
+## 16. Verification checklist
+
+Run this after building (and use it while reading this doc):
+
+```bash
+# backend up (from ../backend/)
+uv run uvicorn backend.main:app --reload
+# frontend up (from this folder)
+npm run dev      # http://localhost:3000
+npm run lint
+```
+
+Manual journey to verify every wired row:
+
+1. `GET /health` → dot turns green (or offline banner if backend stopped).
+2. Register with a weak password → client-side hint; with a duplicate email → field error.
+3. Login → lands on dashboard; refresh the page → session persists (`GET /auth/me` or refresh).
+4. Submit a topic → sidebar shows the thread, MCQ card renders, progress shows `Question 1 of 3`.
+5. Answer all 3 → `scoring` → `score` reveal (85/95/110/128 + level) → explanation streams live.
+6. Open the thread from the sidebar → history replays correctly (question cards parsed, not JSON).
+7. Ask a follow-up → streamed reply; click a "Want to go deeper?" chip → sends itself.
+8. Kill the backend mid-stream → error card/offline banner; restart → Retry works.
+9. Send a message during `assessing` (devtools) → `409` is handled gracefully (should be
+   impossible via UI, since the composer is disabled).
+10. Delete a thread → confirm modal → 204 → card removed → 404 on direct URL.
+
+---
+
+*Extracted from `backend/AGENTS.md` and `backend/src/backend/**` on 2026-09-30. Verified against
+`backend/tests/test_chat_stream.py`, `test_auth_endpoints.py`, `test_topics_endpoints.py`,
+`test_validation_envelope.py`, and `test_chat_e2e.py`.*

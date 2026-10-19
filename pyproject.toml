@@ -23,4 +23,5 @@ members = [
     "RAG/institution_RAG",
     "RAG/medivault/backend",
     "LANGGRAPH/weather_agent",
+    "LANGGRAPH/restaurent_flow/backend",
 ]

@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from routers import books,members,borrows,librarians
+from routers import books,members,borrows
 
 
 app=FastAPI(title="Library Management System",description="A simple library management system built with FastAPI.",version="1.0.0")
@@ -7,7 +7,6 @@ app=FastAPI(title="Library Management System",description="A simple library mana
 app.include_router(books.router)
 app.include_router(members.router)
 app.include_router(borrows.router)
-app.include_router(librarians.router)
 
 @app.get("/")
 def root():

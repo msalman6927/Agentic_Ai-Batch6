@@ -1,14 +1,4 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from typing import Optional
-
-class Librarian(BaseModel):
-    name: str
-    email: str
-
-class LibrarianUpdate(BaseModel):
-    name: Optional[str] = None
-    email: Optional[str] = None
 from models import Book,BookUpdate
 from db import books_db
 from utils import generate_id,record_exists,get_all_records,delete_record,update_record,format_success_message
